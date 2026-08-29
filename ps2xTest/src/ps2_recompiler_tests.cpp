@@ -947,6 +947,64 @@ void register_ps2_recompiler_tests()
             std::filesystem::remove(mapPath, removeError);
         });
 
+        tc.Run("ghidra map end clamps a same-start auto function", [](TestCase &t) {
+            const auto uniqueSuffix = std::to_string(
+                static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
+            const std::filesystem::path elfPath =
+                std::filesystem::temp_directory_path() / ("ps2recomp-ghidra-clamp-" + uniqueSuffix + ".elf");
+            const std::filesystem::path mapPath =
+                std::filesystem::temp_directory_path() / ("ps2recomp-ghidra-clamp-" + uniqueSuffix + ".csv");
+
+            const bool writeOk = writeMinimalMipsElfWithJalFallbackTarget(elfPath);
+            t.IsTrue(writeOk, "temporary ELF should be generated");
+            if (!writeOk)
+            {
+                return;
+            }
+
+            ElfParser parser(elfPath.string());
+            const bool parseOk = parser.parse();
+            t.IsTrue(parseOk, "generated ELF should parse");
+            if (!parseOk)
+            {
+                std::error_code removeError;
+                std::filesystem::remove(elfPath, removeError);
+                return;
+            }
+
+            std::ofstream mapFile(mapPath);
+            t.IsTrue(static_cast<bool>(mapFile), "ghidra map file should be writable");
+            if (!mapFile)
+            {
+                std::error_code removeError;
+                std::filesystem::remove(elfPath, removeError);
+                return;
+            }
+            mapFile << "name,start,end,size\n";
+            mapFile << "FUN_00100010,0x00100010,0x00100014,0x4\n";
+            mapFile.close();
+
+            const bool mapLoaded = parser.loadGhidraFunctionMap(mapPath.string());
+            t.IsTrue(mapLoaded, "ghidra map should load");
+
+            const auto functions = parser.extractFunctions();
+            const auto clampedIt = std::find_if(
+                functions.begin(), functions.end(),
+                [](const Function &fn)
+                { return fn.start == 0x00100010u; });
+            t.IsTrue(clampedIt != functions.end(),
+                     "same-start function should survive the ghidra map merge");
+            if (clampedIt != functions.end())
+            {
+                t.Equals(clampedIt->end, 0x00100014u,
+                         "ghidra end should clamp the analyzer's wider span");
+            }
+
+            std::error_code removeError;
+            std::filesystem::remove(elfPath, removeError);
+            std::filesystem::remove(mapPath, removeError);
+        });
+
         tc.Run("runtime call resolution includes Veronica compatibility aliases", [](TestCase &t) {
             t.Equals(ps2_runtime_calls::resolveSyscallName("ReleaseAlarm"), std::string_view{"ReleaseAlarm"},
                      "ReleaseAlarm should resolve as a syscall name");
