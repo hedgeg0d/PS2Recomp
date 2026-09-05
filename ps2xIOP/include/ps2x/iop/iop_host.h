@@ -63,6 +63,8 @@ namespace ps2x::iop
         virtual bool zeroGuest(uint32_t address, size_t size) = 0;
         virtual bool normalizeGuestAddress(uint32_t address, uint32_t &normalized) const = 0;
         virtual uint32_t allocateIopHandle(IopHandleKind kind) = 0;
+        virtual uint32_t allocateIopHeap(uint32_t size) = 0;
+        virtual bool freeIopHeap(uint32_t address) = 0;
         virtual uint32_t allocateGuest(uint32_t size, uint32_t alignment) = 0;
         virtual void freeGuest(uint32_t address) = 0;
 
@@ -78,8 +80,19 @@ namespace ps2x::iop
                                   size_t size,
                                   size_t &bytesRead) = 0;
         virtual void closeHostFile(uint64_t handle) = 0;
+        virtual bool readCdSectors(uint32_t lbn,
+                                   uint32_t sectors,
+                                   void *destination,
+                                   size_t size) = 0;
 
         virtual int32_t memoryCard(const MemoryCardRequest &request) = 0;
+
+        // Live host pad state for the pad area buffers. The real padman
+        // refreshes these buffers from SIO2 every vsync; without this the
+        // guest observes a frozen controller. Data layout matches the EE
+        // pad status block (mode at [1], buttons at [2..3], sticks at
+        // [4..7]); size must be at least 32.
+        virtual bool readPadState(int port, int slot, uint8_t *data, size_t size) = 0;
 
         virtual bool hasGuestFunction(uint32_t address) const = 0;
         virtual bool invokeGuestFunction(uint64_t callToken,

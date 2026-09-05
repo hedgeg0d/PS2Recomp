@@ -3,6 +3,7 @@
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
 #include "Kernel/Stubs/SIF.h"
+#include "Kernel/Stubs/CD.h"
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Syscalls/Common.h"
@@ -13,6 +14,7 @@
 #include <iostream>
 #include <limits>
 #include <utility>
+#include <vector>
 
 #if !defined(_WIN32)
 #include <sys/types.h>
@@ -154,6 +156,24 @@ bool PS2IopHostAdapter::readGuest(uint32_t address, void *destination, size_t si
 
 bool PS2IopHostAdapter::writeGuest(uint32_t address, const void *source, size_t size)
 {
+    // TEMP-EXPERIMENT: catch the d0/cc/cursor writer. Revert.
+    if (address < 0x5611E0u && address + size > 0x5611C0u)
+    {
+        static int d0w = 0;
+        if (d0w < 40)
+        {
+            ++d0w;
+            const uint8_t *b = static_cast<const uint8_t *>(source);
+            std::printf("[d0-watch] addr=0x%08x size=0x%zx data=%02x%02x%02x%02x...\n",
+                        address,
+                        size,
+                        size > 0 ? b[0] : 0,
+                        size > 1 ? b[1] : 0,
+                        size > 2 ? b[2] : 0,
+                        size > 3 ? b[3] : 0);
+            std::fflush(stdout);
+        }
+    }
     if (!source && size != 0)
     {
         return false;
@@ -172,7 +192,72 @@ bool PS2IopHostAdapter::writeGuest(uint32_t address, const void *source, size_t 
     {
         uint8_t *const rdram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
         ps2TraceGuestRangeWrite(rdram, address, static_cast<uint32_t>(size), "IopHost::writeGuest", nullptr);
+        // Temporary decoder refill probe: identify asynchronous writes to the
+        // bitstream state (qword count lives at +0x10).  This stays in the host
+        // adapter so it does not force generated game objects to rebuild.
+        const uint32_t norm = address & 0x1FFFFFFFu;
+        if (norm <= 0x5611DCu && norm + static_cast<uint32_t>(size) > 0x5611DCu)
+        {
+            const auto *bytes = static_cast<const uint8_t *>(source);
+            std::cerr << "[probe:iop-boot-global-write] addr=0x" << std::hex << address
+                      << " size=0x" << size << " bytes=";
+            const size_t shown = std::min<size_t>(size, 16u);
+            for (size_t i = 0; i < shown; ++i)
+                std::cerr << static_cast<unsigned>(bytes[i]);
+            std::cerr << std::dec << '\n';
+        }
+        if (norm < 0x0101D470u && norm + static_cast<uint32_t>(size) > 0x0101D440u)
+        {
+            const auto *bytes = static_cast<const uint8_t *>(source);
+            std::cerr << "[probe:decoder-range] addr=0x" << std::hex << address
+                      << " size=0x" << size << " bytes=";
+            const size_t shown = std::min<size_t>(size, 0x30u);
+            for (size_t i = 0; i < shown; ++i)
+                std::cerr << static_cast<unsigned>(bytes[i] >> 4)
+                          << static_cast<unsigned>(bytes[i] & 0xFu);
+            std::cerr << std::dec << std::endl;
+        }
         std::memcpy(destination, source, size);
+        // Temporary IOP-to-EE integrity probe.  The Katamari stream is copied
+        // in small staging chunks; compare the source and destination bytes
+        // immediately after each copy to distinguish a transport fault from
+        // a later guest overwrite.  Keep this in the adapter (rather than a
+        // generated header) so diagnostics do not invalidate the translation
+        // cache.
+        {
+            const uint32_t normEnd = norm + static_cast<uint32_t>(size);
+            if (norm < 0x01E4D080u + 0x1A1770u && normEnd > 0x01E4D080u)
+            {
+                static uint32_t streamWriteProbeCount = 0u;
+                if (streamWriteProbeCount < 24u)
+                {
+                    const auto *bytes = static_cast<const uint8_t *>(source);
+                    uint64_t sourceHash = 1469598103934665603ull;
+                    uint64_t destHash = 1469598103934665603ull;
+                    for (size_t i = 0; i < size; ++i)
+                    {
+                        sourceHash ^= bytes[i];
+                        sourceHash *= 1099511628211ull;
+                        destHash ^= destination[i];
+                        destHash *= 1099511628211ull;
+                    }
+                    std::cerr << "[probe:iop-host-write] addr=0x" << std::hex << address
+                              << " size=0x" << size << " srcfnv=0x" << sourceHash
+                              << " dstfnv=0x" << destHash << " first=";
+                    const size_t shown = std::min<size_t>(size, 16u);
+                    for (size_t i = 0; i < shown; ++i)
+                        std::cerr << (i ? " " : "") << static_cast<unsigned>(destination[i]);
+                    std::cerr << std::dec << '\n';
+                    ++streamWriteProbeCount;
+                }
+                if ((norm < 0x01F2D080u && normEnd > 0x01F0D080u) ||
+                    (norm < 0x01FEE7F0u && normEnd > 0x01FCD080u))
+                {
+                    std::cerr << "[probe:iop-host-overlap] addr=0x" << std::hex << address
+                              << " size=0x" << size << " norm=0x" << norm << std::dec << '\n';
+                }
+            }
+        }
     }
     return true;
 }
@@ -229,6 +314,16 @@ uint32_t PS2IopHostAdapter::allocateIopHandle(ps2x::iop::IopHandleKind kind)
                : rpcAllocServerAddr(rdram);
 }
 
+uint32_t PS2IopHostAdapter::allocateIopHeap(uint32_t size)
+{
+    return ps2_stubs::allocateSifIopHeap(size);
+}
+
+bool PS2IopHostAdapter::freeIopHeap(uint32_t address)
+{
+    return ps2_stubs::freeSifIopHeap(address);
+}
+
 uint32_t PS2IopHostAdapter::allocateGuest(uint32_t size, uint32_t alignment)
 {
     return m_runtime.guestMalloc(size, alignment);
@@ -246,13 +341,51 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
 {
     uint8_t *sendPointer = nullptr;
     uint8_t *receivePointer = nullptr;
+    std::vector<uint8_t> sendStorage;
+    std::vector<uint8_t> receiveStorage;
+    const bool sendIsIopHeap = send.address != 0u &&
+                               ps2_stubs::isSifIopHeapAddress(send.address);
+    const bool receiveIsIopHeap = receive.address != 0u &&
+                                  ps2_stubs::isSifIopHeapAddress(receive.address);
+    if (sendIsIopHeap)
+    {
+        sendStorage.resize(send.size);
+        if (!ps2_stubs::readSifIopHeap(send.address, sendStorage.data(), sendStorage.size()))
+        {
+            sendStorage.clear();
+        }
+        else
+        {
+            sendPointer = sendStorage.data();
+        }
+    }
+    if (receiveIsIopHeap)
+    {
+        receiveStorage.resize(receive.size);
+        if (!ps2_stubs::readSifIopHeap(receive.address,
+                                       receiveStorage.data(),
+                                       receiveStorage.size()))
+        {
+            receiveStorage.clear();
+        }
+        else
+        {
+            receivePointer = receiveStorage.data();
+        }
+    }
     if (send.address && !guestRange(send.address, send.size, sendPointer))
     {
-        sendPointer = nullptr;
+        if (!sendIsIopHeap)
+        {
+            sendPointer = nullptr;
+        }
     }
     if (receive.address && !guestRange(receive.address, receive.size, receivePointer))
     {
-        receivePointer = nullptr;
+        if (!receiveIsIopHeap)
+        {
+            receivePointer = nullptr;
+        }
     }
     m_runtime.audioBackend().onSoundCommand(sid,
                                             function,
@@ -260,6 +393,12 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
                                             send.size,
                                             receivePointer,
                                             receive.size);
+    if (receivePointer && receiveIsIopHeap)
+    {
+        (void)ps2_stubs::writeSifIopHeap(receive.address,
+                                         receiveStorage.data(),
+                                         receiveStorage.size());
+    }
 }
 
 std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
@@ -395,8 +534,20 @@ void PS2IopHostAdapter::closeHostFile(uint64_t handle)
     }
 }
 
-int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &request)
+bool PS2IopHostAdapter::readCdSectors(uint32_t lbn,
+                                      uint32_t sectors,
+                                      void *destination,
+                                      size_t size)
 {
+    return ps2_stubs::readCdSectorsForIop(lbn, sectors, destination, size);
+}
+
+bool PS2IopHostAdapter::readPadState(int port, int slot, uint8_t *data, size_t size)
+{
+    return m_runtime.padBackend().readState(port, slot, data, size);
+}
+
+int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &request){
     using Handler = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
     Handler handler = nullptr;
     switch (request.operation)

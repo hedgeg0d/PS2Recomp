@@ -325,18 +325,51 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 
 #define READ8(addr) ([&]() -> uint8_t {                       \
     uint32_t _addr = (uint32_t)(addr);                        \
+    if (_addr >= 0x101BE80u && _addr < 0x101C080u)            \
+    {                                                        \
+        static int padr8 = 0;                                \
+        if (padr8 < 5)                                       \
+        {                                                    \
+            ++padr8;                                         \
+            std::cerr << "[padr8] addr=0x" << std::hex       \
+                      << _addr << " pc=0x" << ctx->pc        \
+                      << std::dec << std::endl;               \
+        }                                                    \
+    }                                                        \
     return PS2Runtime::isSpecialAddress(_addr)                \
         ? runtime->Load8(rdram, ctx, _addr)                   \
         : FAST_READ8(_addr); }())
 
-#define READ16(addr) ([&]() -> uint16_t {                     \
+#define READ16(addr) ([&]() -> uint16_t {                   \
     uint32_t _addr = (uint32_t)(addr);                        \
+    if (_addr >= 0x101BE80u && _addr < 0x101C080u)            \
+    {                                                        \
+        static int padr16 = 0;                               \
+        if (padr16 < 5)                                      \
+        {                                                    \
+            ++padr16;                                        \
+            std::cerr << "[padr16] addr=0x" << std::hex      \
+                      << _addr << " pc=0x" << ctx->pc        \
+                      << std::dec << std::endl;               \
+        }                                                    \
+    }                                                        \
     return PS2Runtime::isSpecialAddress(_addr)                \
         ? runtime->Load16(rdram, ctx, _addr)                  \
         : FAST_READ16(_addr); }())
 
 #define READ32(addr) ([&]() -> uint32_t {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
+    if (_addr >= 0x101BE80u && _addr < 0x101C080u)            \
+    {                                                        \
+        static int padr32 = 0;                               \
+        if (padr32 < 5)                                      \
+        {                                                    \
+            ++padr32;                                        \
+            std::cerr << "[padr32] addr=0x" << std::hex      \
+                      << _addr << " pc=0x" << ctx->pc        \
+                      << std::dec << std::endl;               \
+        }                                                    \
+    }                                                        \
     return PS2Runtime::isSpecialAddress(_addr)                \
         ? runtime->Load32(rdram, ctx, _addr)                  \
         : FAST_READ32(_addr); }())
@@ -361,6 +394,14 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             runtime->Store8(rdram, ctx, _addr, (val));                               \
         else                                                                         \
         {                                                                            \
+            if ((_addr >= 0x5611C0u && _addr < 0x5611E0u) ||                              \
+                (_addr >= 0x101D420u && _addr < 0x101D470u) ||                         \
+                (_addr >= 0x9878F0u && _addr < 0x987910u))                             \
+            {                                                                        \
+                std::cerr << "[d0w8] addr=0x" << std::hex << _addr                    \
+                          << " val=0x" << (uint32_t)(uint8_t)(val)                    \
+                          << " pc=0x" << ctx->pc << std::dec << std::endl;            \
+            }                                                                        \
             ps2TraceGuestWrite(rdram, _addr, 1u, (uint8_t)(val), 0u, "WRITE8", ctx); \
             FAST_WRITE8(_addr, (val));                                               \
         }                                                                            \
@@ -370,10 +411,18 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
     do                                                                                 \
     {                                                                                  \
         uint32_t _addr = (addr);                                                       \
-        if (PS2Runtime::isSpecialAddress(_addr))                                       \
+        if (PS2Runtime::isSpecialAddress(_addr))                                     \
             runtime->Store16(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
+            if ((_addr >= 0x5611C0u && _addr < 0x5611E0u) ||                              \
+                (_addr >= 0x101D420u && _addr < 0x101D470u) ||                         \
+                (_addr >= 0x9878F0u && _addr < 0x987910u))                             \
+            {                                                                        \
+                std::cerr << "[d0w16] addr=0x" << std::hex << _addr                   \
+                          << " val=0x" << (uint32_t)(uint16_t)(val)                   \
+                          << " pc=0x" << ctx->pc << std::dec << std::endl;            \
+            }                                                                        \
             ps2TraceGuestWrite(rdram, _addr, 2u, (uint16_t)(val), 0u, "WRITE16", ctx); \
             FAST_WRITE16(_addr, (val));                                                \
         }                                                                              \
@@ -387,6 +436,14 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             runtime->Store32(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
+            if ((_addr >= 0x5611C0u && _addr < 0x5611E0u) ||                           \
+                (_addr >= 0x101D420u && _addr < 0x101D470u) ||                         \
+                (_addr >= 0x9878F0u && _addr < 0x987910u))                             \
+            {                                                                        \
+                std::cerr << "[d0w32] addr=0x" << std::hex << _addr                   \
+                          << " val=0x" << (uint32_t)(val)                             \
+                          << " pc=0x" << ctx->pc << std::dec << std::endl;            \
+            }                                                                        \
             ps2TraceGuestWrite(rdram, _addr, 4u, (uint32_t)(val), 0u, "WRITE32", ctx); \
             FAST_WRITE32(_addr, (val));                                                \
         }                                                                              \
@@ -400,6 +457,9 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             runtime->Store64(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
+            if (_addr >= 0x1FF00000u && static_cast<uint32_t>((val)) == 0x54DAC0u)      \
+                std::cerr << "[probe:stack64_54] addr=0x" << std::hex << _addr         \
+                          << " pc=0x" << ctx->pc << std::dec << std::endl;             \
             ps2TraceGuestWrite(rdram, _addr, 8u, (uint64_t)(val), 0u, "WRITE64", ctx); \
             FAST_WRITE64(_addr, (val));                                                \
         }                                                                              \
@@ -743,6 +803,10 @@ static inline void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i new_low)
 {
     if (reg != 0)
     {
+        if (reg == 31 && PS2_EXTRACT_EPI32_0(new_low) == 0x54DAC0u)
+        {
+            std::cerr << "[probe:ra54] pc=0x" << std::hex << ctx->pc << std::dec << std::endl;
+        }
         ctx->r[reg] = _mm_castpd_si128(_mm_move_sd(_mm_castsi128_pd(ctx->r[reg]), _mm_castsi128_pd(new_low)));
     }
 }
@@ -754,6 +818,19 @@ static inline void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i new_low)
         {                                                                 \
             __m128i _newVal = _mm_cvtsi64_si128((int64_t)(int32_t)(val)); \
                                                                           \
+            Ps2SetGprLow64(ctx_ptr, reg_idx, _newVal);                    \
+        }                                                                 \
+    } while (0)
+
+// Unsigned 32-bit loads (LBU/LHU/LWU) zero-extend into the R5900 GPR.
+// Keep this distinct from SET_GPR_U32, whose historical contract is the
+// sign-extending result used by ordinary 32-bit ALU operations.
+#define SET_GPR_ZE32(ctx_ptr, reg_idx, val)                               \
+    do                                                                    \
+    {                                                                     \
+        if ((reg_idx) != 0)                                               \
+        {                                                                 \
+            __m128i _newVal = _mm_cvtsi64_si128((int64_t)(uint32_t)(val)); \
             Ps2SetGprLow64(ctx_ptr, reg_idx, _newVal);                    \
         }                                                                 \
     } while (0)

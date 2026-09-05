@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -250,6 +251,12 @@ namespace ps2x::iop
         }
     }
 
+    bool IopSubsystem::hasRpcService(uint32_t sid) const
+    {
+        const auto it = m_impl->routes.find(sid);
+        return it != m_impl->routes.end() && it->second != nullptr;
+    }
+
     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
     {
         for (const auto &service : m_impl->profileServices)
@@ -279,6 +286,20 @@ namespace ps2x::iop
 
     RpcResult IopSubsystem::handleRpc(const RpcRequest &request)
     {
+        // TEMP-EXPERIMENT: log every IOP RPC to find libmc's MCMAN traffic. Revert.
+        {
+            static int rpcCount = 0;
+            if (rpcCount < 120)
+            {
+                ++rpcCount;
+                std::printf("[ioprpc] n=%d sid=0x%08x fn=0x%x send=0x%x/%u recv=0x%x/%u cli=0x%x srv=0x%x\n",
+                            rpcCount, request.sid, request.function,
+                            request.send.address, request.send.size,
+                            request.receive.address, request.receive.size,
+                            request.clientAddress, request.serverAddress);
+                std::fflush(stdout);
+            }
+        }
         const auto it = m_impl->routes.find(request.sid);
         if (it == m_impl->routes.end() || !it->second)
         {
@@ -301,6 +322,32 @@ namespace ps2x::iop
             if (service)
             {
                 service->onSifTransfer(transfer);
+            }
+        }
+    }
+
+    void IopSubsystem::onVBlank()
+    {
+        // TEMP-EXPERIMENT: prove VBlank reaches services. Revert.
+        static int vblankCount = 0;
+        if (vblankCount < 3)
+        {
+            std::printf("[vblank-sys] n=%d\n", vblankCount);
+            std::fflush(stdout);
+        }
+        ++vblankCount;
+        for (auto &service : m_impl->coreServices)
+        {
+            if (service)
+            {
+                service->onVBlank();
+            }
+        }
+        for (auto &service : m_impl->profileServices)
+        {
+            if (service)
+            {
+                service->onVBlank();
             }
         }
     }

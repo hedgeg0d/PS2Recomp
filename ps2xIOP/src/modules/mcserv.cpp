@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -18,8 +19,24 @@ namespace ps2x::iop::detail
         constexpr uint32_t kMcservDev9Sid = 0x80000480u;
         constexpr int32_t kSucceeded = 0;
         constexpr int32_t kDenied = -5;
-        constexpr uint32_t kMcservVersion = 0x0205u;
-        constexpr uint32_t kMcmanVersion = 0x0206u;
+        // TEMP-EXPERIMENT: PS2X_MCSERV_VER / PS2X_MCMAN_VER hex overrides
+        // to find the minimum the game's libmc accepts. Revert to constants.
+        uint32_t mcservVersion()
+        {
+            if (const char *e = std::getenv("PS2X_MCSERV_VER"))
+            {
+                return static_cast<uint32_t>(std::strtoul(e, nullptr, 16));
+            }
+            return 0x0207u;
+        }
+        uint32_t mcmanVersion()
+        {
+            if (const char *e = std::getenv("PS2X_MCMAN_VER"))
+            {
+                return static_cast<uint32_t>(std::strtoul(e, nullptr, 16));
+            }
+            return 0x0208u;
+        }
         constexpr uint32_t kCreateDirectory = 0x0040u;
 
         enum class Operation
@@ -154,6 +171,21 @@ namespace ps2x::iop::detail
 
                 Flavor flavor = Flavor::NewXmcserv;
                 const Operation operation = decodeOperation(request.function, flavor);
+                // TEMP-EXPERIMENT: trace game MC ops. Revert.
+                {
+                    static int mcCount = 0;
+                    if (mcCount < 60)
+                    {
+                        ++mcCount;
+                        std::printf("[mcserv] n=%d fn=0x%x op=%d send=0x%x recv=0x%x\n",
+                                    mcCount,
+                                    request.function,
+                                    static_cast<int>(operation),
+                                    request.send.address,
+                                    request.receive.address);
+                        std::fflush(stdout);
+                    }
+                }
                 if (operation == Operation::Init)
                 {
                     (void)call(MemoryCardOperation::Init);
@@ -257,7 +289,7 @@ namespace ps2x::iop::detail
                     return;
                 }
                 const std::array<uint32_t, 3> values = {
-                    static_cast<uint32_t>(kSucceeded), kMcservVersion, kMcmanVersion};
+                    static_cast<uint32_t>(kSucceeded), mcservVersion(), mcmanVersion()};
                 const uint32_t bytes = std::min<uint32_t>(receive.size, sizeof(values));
                 (void)m_host.writeGuest(receive.address, values.data(), bytes);
                 if (receive.size > bytes)

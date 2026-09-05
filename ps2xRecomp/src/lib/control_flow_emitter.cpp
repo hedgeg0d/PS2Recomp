@@ -256,6 +256,43 @@ namespace ps2recomp
 
         if (isReturn)
         {
+            // A generated slice may contain small helper blocks that return
+            // through $ra to another block in the same slice (for example a
+            // bit-reader helper called from a tight decoder loop).  Returning
+            // to the host dispatcher for those local targets is correct but
+            // turns every guest byte into a scheduler boundary.  Resume local
+            // targets directly and retain runtime dispatch for genuinely
+            // external returns.  Limit the switch size to keep large slices
+            // compact; those still use the normal external path.
+            std::vector<uint32_t> localReturnTargets;
+            if (m_analysisResult.entryPoints.size() <= 64u)
+            {
+                for (const uint32_t target : m_analysisResult.entryPoints)
+                {
+                    if (target >= m_function.start && target < m_function.end && target != m_function.start)
+                    {
+                        localReturnTargets.push_back(target);
+                    }
+                }
+                std::sort(localReturnTargets.begin(), localReturnTargets.end());
+                localReturnTargets.erase(std::unique(localReturnTargets.begin(), localReturnTargets.end()),
+                                         localReturnTargets.end());
+            }
+            if (!localReturnTargets.empty())
+            {
+                m_ss << indent << "{\n";
+                m_ss << indent << "    const uint32_t localReturnTarget = " << jumpTargetExpression << ";\n";
+                m_ss << indent << "    switch (localReturnTarget) {\n";
+                for (const uint32_t target : localReturnTargets)
+                {
+                    m_ss << indent << "    case 0x" << fmt::format("{:X}", target) << "u:\n";
+                    m_ss << indent << "        ctx->pc = localReturnTarget;\n";
+                    m_ss << indent << "        goto label_" << fmt::format("{:x}", target) << ";\n";
+                }
+                m_ss << indent << "    default: break;\n";
+                m_ss << indent << "    }\n";
+                m_ss << indent << "}\n";
+            }
             m_ss << indent << "#if defined(PS2X_STRICT_RETURN_DIAGNOSTICS) && PS2X_STRICT_RETURN_DIAGNOSTICS\n";
             m_ss << indent << "(void)runtime->dispatchGuestBranch(rdram, ctx, " << jumpTargetExpression
                  << ", 0x" << fmt::format("{:X}", branchPc())
@@ -406,10 +443,14 @@ namespace ps2recomp
             return fmt::format("GPR_U64(ctx, {}) != GPR_U64(ctx, {})", rsReg, rtReg);
         case OPCODE_BLEZ:
         case OPCODE_BLEZL:
-            return fmt::format("GPR_S32(ctx, {}) <= 0", rsReg);
+            // R5900 branch conditions inspect the full 64-bit GPR.  Using
+            // the low signed word is only correct for values whose upper
+            // half is already a sign extension and misroutes valid MIPS64
+            // pointers/counters with bit 31 set.
+            return fmt::format("GPR_S64(ctx, {}) <= 0", rsReg);
         case OPCODE_BGTZ:
         case OPCODE_BGTZL:
-            return fmt::format("GPR_S32(ctx, {}) > 0", rsReg);
+            return fmt::format("GPR_S64(ctx, {}) > 0", rsReg);
         case OPCODE_REGIMM:
             switch (m_branchInst.rt)
             {
@@ -417,12 +458,12 @@ namespace ps2recomp
             case REGIMM_BLTZL:
             case REGIMM_BLTZAL:
             case REGIMM_BLTZALL:
-                return fmt::format("GPR_S32(ctx, {}) < 0", rsReg);
+                return fmt::format("GPR_S64(ctx, {}) < 0", rsReg);
             case REGIMM_BGEZ:
             case REGIMM_BGEZL:
             case REGIMM_BGEZAL:
             case REGIMM_BGEZALL:
-                return fmt::format("GPR_S32(ctx, {}) >= 0", rsReg);
+                return fmt::format("GPR_S64(ctx, {}) >= 0", rsReg);
             default:
                 return "false";
             }

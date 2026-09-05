@@ -100,6 +100,45 @@ namespace
         return socket;
     }
 
+    static bool getDeci2Session(int32_t socket, Deci2Session &session)
+    {
+        std::lock_guard<std::mutex> lock(g_deci2Mutex);
+        const auto it = g_deci2Sessions.find(socket);
+        if (it == g_deci2Sessions.end())
+        {
+            return false;
+        }
+
+        session = it->second;
+        return true;
+    }
+
+    static void invokeDeci2Handler(uint8_t *rdram,
+                                   R5900Context *ctx,
+                                   PS2Runtime *runtime,
+                                   const Deci2Session &session,
+                                   uint32_t event,
+                                   uint32_t parameter)
+    {
+        if (!runtime || session.handler == 0u || !runtime->hasFunction(session.handler))
+        {
+            return;
+        }
+
+        GuestInvocation callback{};
+        callback.kind = GuestInvocationKind::HleCall;
+        callback.context = *ctx;
+        callback.context.pc = session.handler;
+        SET_GPR_U32(&callback.context, 4, event);
+        SET_GPR_U32(&callback.context, 5, parameter);
+        SET_GPR_U32(&callback.context, 6, session.opt);
+        SET_GPR_U32(&callback.context, 7, 0u);
+        SET_GPR_U32(&callback.context, 29, runtime->eeScheduler().invocationStackTop());
+        SET_GPR_U32(&callback.context, 31, 0u);
+        callback.onComplete = [](const R5900Context &, R5900Context &) {};
+        runtime->eeScheduler().invokeCurrent(std::move(callback));
+    }
+
     static bool updateDeci2LockState(int32_t socket, bool locked)
     {
         std::lock_guard<std::mutex> lock(g_deci2Mutex);
@@ -125,7 +164,6 @@ namespace ps2_syscalls
 {
     void Deci2Call(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-#if defined(_DEBUG) || defined(RUNTIME_DECI2CALL)
         const int32_t code = static_cast<int32_t>(getRegU32(ctx, 4));
         const uint32_t argsAddr = getRegU32(ctx, 5);
 
@@ -151,12 +189,34 @@ namespace ps2_syscalls
             setReturnS32(ctx, closeDeci2Socket(socket) ? KE_OK : KE_ERROR);
             return;
         }
-        // WE dont need to do thouses
         case 3:  // sceDeci2ReqSend(socket, dest)
-        case 4:  // sceDeci2Poll(socket)
         case -7: // sceDeci2ExReqSend(socket, dest)
         {
-            setReturnS32(ctx, KE_OK);
+            Deci2Session session;
+            const int32_t socket = static_cast<int32_t>(args[0]);
+            if (!getDeci2Session(socket, session))
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+
+            // The request is delivered as a write notification. The guest
+            // handler performs ExSend and advances its pending state.
+            invokeDeci2Handler(rdram, ctx, runtime, session, 3u, args[1]);
+            return;
+        }
+        case 4:  // sceDeci2Poll(socket)
+        {
+            Deci2Session session;
+            const int32_t socket = static_cast<int32_t>(args[0]);
+            if (!getDeci2Session(socket, session))
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+
+            // Poll completion is the corresponding WRITE_DONE event.
+            invokeDeci2Handler(rdram, ctx, runtime, session, 4u, 0u);
             return;
         }
         case -5: // sceDeci2ExRecv(socket, buf, len)
@@ -230,6 +290,5 @@ namespace ps2_syscalls
             return;
         }
         }
-#endif
     }
 }

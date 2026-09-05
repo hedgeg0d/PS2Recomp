@@ -40,6 +40,10 @@ namespace ps2_stubs
     };
 
     CdDebugSnapshot getCdDebugSnapshot();
+    bool readCdSectorsForIop(uint32_t lbn,
+                            uint32_t sectors,
+                            void *destination,
+                            size_t size);
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdGetError(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

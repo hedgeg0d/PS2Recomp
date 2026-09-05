@@ -309,6 +309,44 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kTimer0Count), 0u, "ZRET should clear COUNT when it equals COMP");
         });
 
+        tc.Run("IO registers are readable through 8/16/32/64-bit memory reads", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            // Timer2 MODE at 0x10001010 is in RDRAM alias range but must read IO state.
+            constexpr uint32_t kT2Mode = 0x10001010u;
+            constexpr uint32_t kT2ModeValue = 0x280u;
+            t.IsTrue(mem.writeIORegister(kT2Mode, kT2ModeValue), "T2 MODE write should succeed");
+            t.Equals(mem.read32(kT2Mode), kT2ModeValue, "read32 should return IO register, not RDRAM");
+            t.Equals(static_cast<uint32_t>(mem.read8(kT2Mode)), kT2ModeValue & 0xFFu, "read8 low byte should match IO");
+            t.Equals(static_cast<uint32_t>(mem.read8(kT2Mode + 1u)), (kT2ModeValue >> 8) & 0xFFu, "read8 high byte should match IO");
+            t.Equals(mem.read16(kT2Mode), static_cast<uint16_t>(kT2ModeValue & 0xFFFFu), "read16 should match IO");
+            const uint64_t v64 = mem.read64(kT2Mode & ~0x7u);
+            // read64 composes two IO slots; low dword should be MODE, high dword should be next reg (hold/compare)
+            t.IsTrue((v64 & 0xFFFFFFFFull) == kT2ModeValue, "read64 low dword should be IO MODE");
+        });
+
+        tc.Run("VIF DMA chains forward the tag upper stream on REF tags", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kTagAddr = 0x00030000u;
+            constexpr uint32_t kPayloadAddr = 0x00030100u;
+            constexpr uint32_t kVif1Tadr = 0x10009030u;
+            constexpr uint32_t kVif1Chcr = 0x10009000u;
+            const uint64_t tag = makeDmaTag(1u, 3u, kPayloadAddr);
+            const uint64_t upperStream = static_cast<uint64_t>(makeVifCmd(0x05u, 0u, 2u)); // STMOD
+            writeU64(mem.getRDRAM(), kTagAddr, tag);
+            writeU64(mem.getRDRAM(), kTagAddr + 8u, upperStream);
+            std::memset(mem.getRDRAM() + kPayloadAddr, 0, 16u);
+
+            t.IsTrue(mem.writeIORegister(kVif1Tadr, kTagAddr), "VIF1 TADR write should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Chcr, (1u << 2u) | 0x100u), "VIF1 chain start should succeed");
+            t.Equals(mem.vif1_regs.mode, 2u,
+                     "VIF1 should consume the VIF stream carried in a REF tag upper half");
+        });
+
         tc.Run("scratchpad alias accesses the same bytes as base", [](TestCase &t)
         {
             PS2Memory mem;

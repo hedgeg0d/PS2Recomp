@@ -4,13 +4,32 @@
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 
 namespace
 {
+    uint64_t katamariStreamHash(const uint8_t *rdram, uint32_t base)
+    {
+        uint64_t hash = 1469598103934665603ull;
+        for (uint32_t i = 0u; i < 0x20000u; ++i)
+        {
+            hash ^= rdram[base + i];
+            hash *= 1099511628211ull;
+        }
+        return hash;
+    }
+
+    bool g_katamariFullMonitorArmed = false;
+    uint64_t g_katamariPreviousFull6 = 0u;
+    uint64_t g_katamariPreviousFullC = 0u;
+    std::array<uint8_t, 0x20000u> g_katamariBaseline6{};
+    std::array<uint8_t, 0x20000u> g_katamariBaselineC{};
+
     constexpr int KE_OK = 0;
     constexpr int KE_ERROR = -1;
     constexpr int KE_ILLEGAL_PRIORITY = -403;
@@ -124,6 +143,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     }
     m_eventSequence = 0;
     m_invocationSequence = 0;
+    m_invocationStackTops.clear();
     m_vsyncTick = 0;
     m_vsyncFlagAddress = 0;
     m_vsyncTickAddress = 0;
@@ -141,6 +161,9 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     // returned by ReferThreadStatus. SetupThread records that metadata.
     main.stack = 0u;
     main.gp = getRegU32(&mainContext, 28);
+    // The EE bootstrap thread is created at kernel priority 0 on hardware.
+    // Keeping that priority also lets it time-slice fairly with the SIF/RPC
+    // service thread, instead of a priority-0 service loop starving boot.
     main.initialPriority = 0;
     main.currentPriority = 0;
     main.status = EeThreadStatus::Ready;
@@ -186,7 +209,8 @@ void EeScheduler::run()
                 owner->status = EeThreadStatus::Running;
                 m_currentThreadId = owner->id;
                 renewTimeSlice();
-                if (getRegU32(&invocation.context, 29) == 0u)
+                if (invocation.kind == GuestInvocationKind::Interrupt ||
+                    getRegU32(&invocation.context, 29) == 0u)
                 {
                     SET_GPR_U32(&invocation.context, 29, invocationStackTop());
                 }
@@ -245,6 +269,26 @@ void EeScheduler::run()
                     {
                     }
                 }
+                // A burst of IRQ completions must not monopolize the owner
+                // thread.  Once one interrupt frame returns, yield the owner
+                // when more callbacks are queued so normal ready threads can
+                // make progress before the next asynchronous delivery.
+                if (completed.kind == GuestInvocationKind::Interrupt &&
+                    !m_pendingInvocations.empty())
+                {
+                    // Dispatcher-only owners are not runnable guest threads;
+                    // leave the pseudo-thread dormant so a pending IRQ does
+                    // not continually win the ready queue over real EE work.
+                    if (running->id < 0)
+                    {
+                        makeDormant(*running);
+                    }
+                    else
+                    {
+                        enqueueReady(*running, false);
+                    }
+                    m_currentThreadId = 0;
+                }
                 continue;
             }
             makeDormant(*running);
@@ -252,11 +296,19 @@ void EeScheduler::run()
             continue;
         }
 
-        if (!m_pendingInvocations.empty())
+        // Do not preempt an active interrupt callback with another pending
+        // invocation.  IRQ dispatch queues completions raised by a callback;
+        // pushing them here would recursively grow the guest callback stack
+        // before the current handler reaches its JR $ra.  Retain the queue
+        // until the interrupt frame completes, then service it normally.
+        const bool activeInterrupt = !running->invocations.empty() &&
+                                     running->invocations.back().kind == GuestInvocationKind::Interrupt;
+        if (!m_pendingInvocations.empty() && !activeInterrupt)
         {
             GuestInvocation invocation = std::move(m_pendingInvocations.front());
             m_pendingInvocations.pop_front();
-            if (getRegU32(&invocation.context, 29) == 0u)
+            if (invocation.kind == GuestInvocationKind::Interrupt ||
+                getRegU32(&invocation.context, 29) == 0u)
             {
                 SET_GPR_U32(&invocation.context, 29, invocationStackTop());
             }
@@ -278,6 +330,19 @@ void EeScheduler::run()
                                                 context.pc,
                                                 PS2Runtime::GuestBranchKind::DirectJump,
                                                 "EE scheduler");
+                if (context.pc == 0x54DAC0u)
+                {
+                    std::cerr << "[probe:stack54] sp=0x" << std::hex << getRegU32(&context, 29)
+                              << " words=";
+                    const uint32_t sp = getRegU32(&context, 29);
+                    for (int32_t off = -0x40; off < 0x80; off += 8)
+                    {
+                        const uint32_t addr = (sp + static_cast<uint32_t>(off)) & PS2_RAM_MASK;
+                        std::cerr << " " << (off >= 0 ? "+" : "") << off << ":" << Ps2FastRead32(m_rdram, addr)
+                                  << "," << Ps2FastRead32(m_rdram, addr + 4);
+                    }
+                    std::cerr << std::dec << std::endl;
+                }
                 makeDormant(*running);
                 m_currentThreadId = 0;
             }
@@ -290,18 +355,458 @@ void EeScheduler::run()
             continue;
         }
 
+        const uint32_t executingPc = context.pc;
+        // Temporary Katamari boot trace: keep the first few scheduler slices
+        // visible so a task-registration loop can be localized without
+        // instrumenting generated game code.  This is bounded and side-effect
+        // free; remove once the generic scheduler issue is resolved.
+        {
+            static uint32_t bootPcTraceCount = 0u;
+            if (bootPcTraceCount < 320u)
+            {
+                std::cerr << "[probe:sched-pc] tid=" << running->id
+                          << " pc=0x" << std::hex << executingPc
+                          << " ra=0x" << getRegU32(&context, 31)
+                          << " sp=0x" << getRegU32(&context, 29)
+                          << std::dec << '\n';
+                ++bootPcTraceCount;
+            }
+        }
+        if (executingPc == 0x1038140u || executingPc == 0x10381A0u ||
+            executingPc == 0x10382B0u || executingPc == 0x10382DCu ||
+            executingPc == 0x103836Cu || executingPc == 0x1673D8u ||
+            executingPc == 0x1673F0u || executingPc == 0x1673F8u ||
+            executingPc == 0x167400u || executingPc == 0x167408u)
+        {
+            static uint32_t initPathProbeCount = 0u;
+            if (initPathProbeCount < 160u)
+            {
+                std::cerr << "[probe:init-path] tid=" << running->id
+                          << " pc=0x" << std::hex << executingPc
+                          << " next=0x" << context.pc
+                          << " ra=0x" << getRegU32(&context, 31)
+                          << " sp=0x" << getRegU32(&context, 29)
+                          << " ready=" << static_cast<unsigned>(m_rdram[0x101D394u])
+                          << " busy=" << static_cast<unsigned>(m_rdram[0x101DB77u])
+                          << std::dec << '\n';
+                ++initPathProbeCount;
+            }
+        }
         try
         {
+            // Keep a bounded view of the MPEG/resource worker after the
+            // initial refill.  The worker is split across several generated
+            // entry points (0x188010..0x1881c8), so logging only one entry
+            // misses the cross-slice continuation at EOF.
+            if (running->id == 3)
+            {
+                static uint32_t decoderBoundaryProbeCount = 0u;
+                if (decoderBoundaryProbeCount < 160u)
+                {
+                    std::cerr << "[probe:decoder-boundary] pc=0x" << std::hex << executingPc
+                              << " next=0x" << context.pc
+                              << " state08=0x" << Ps2FastRead32(m_rdram, 0x101D448u)
+                              << " state0c=0x" << Ps2FastRead32(m_rdram, 0x101D44Cu)
+                              << " state10=0x" << Ps2FastRead32(m_rdram, 0x101D450u)
+                              << " state14=0x" << Ps2FastRead32(m_rdram, 0x101D454u)
+                              << " state18=0x" << Ps2FastRead32(m_rdram, 0x101D458u)
+                              << " state1c=0x" << Ps2FastRead16(m_rdram, 0x101D45Cu)
+                              << " status=0x" << static_cast<unsigned>(m_rdram[0x101D45Eu])
+                              << std::dec;
+                    const uint32_t out = Ps2FastRead32(m_rdram, 0x101D44Cu) & PS2_RAM_MASK;
+                    uint64_t hash = 1469598103934665603ull;
+                    uint32_t nonzero = 0u;
+                    if (out < PS2_RAM_SIZE)
+                    {
+                        const uint32_t bytes = std::min<uint32_t>(0x2000u, PS2_RAM_SIZE - out);
+                        for (uint32_t i = 0u; i < bytes; ++i)
+                        {
+                            const uint8_t b = m_rdram[out + i];
+                            hash ^= b;
+                            hash *= 1099511628211ull;
+                            nonzero += (b != 0u) ? 1u : 0u;
+                        }
+                    }
+                    std::cerr << " outHash=0x" << std::hex << hash
+                              << " outNonzero=0x" << nonzero << std::dec << '\n';
+                    ++decoderBoundaryProbeCount;
+                }
+            }
+            // Temporary decoder-state probe: the guest MPEG worker is a
+            // normal EE thread, so its entry bypasses dispatchGuestBranch.
+            // Keep this diagnostic in the scheduler while tracing the
+            // generic async-I/O contract; it does not alter guest state.
+            if (executingPc == 0x188010u || executingPc == 0x188028u || executingPc == 0x188034u)
+            {
+                static uint32_t decoderProbeCount = 0u;
+                if (decoderProbeCount < 64u)
+                {
+                    const uint32_t state = 0x101D440u;
+                    std::cerr << "[probe:decoder-thread] pc=0x" << std::hex << executingPc
+                              << " status=0x" << running->context.cop0_status
+                              << " state+08=0x" << std::hex
+                              << Ps2FastRead32(m_rdram, state + 0x08u)
+                              << " +0c=0x" << Ps2FastRead32(m_rdram, state + 0x0Cu)
+                              << " +10=0x" << Ps2FastRead32(m_rdram, state + 0x10u)
+                              << " +14=0x" << Ps2FastRead32(m_rdram, state + 0x14u)
+                              << " +18=0x" << Ps2FastRead32(m_rdram, state + 0x18u)
+                              << " +1c=0x" << Ps2FastRead32(m_rdram, state + 0x1Cu)
+                              << " +1e=0x" << static_cast<unsigned>(m_rdram[state + 0x1Eu])
+                              << " input=";
+                    for (uint32_t i = 0; i < 16u; ++i)
+                    {
+                        std::cerr << (i == 0u ? "" : " ")
+                                  << static_cast<unsigned>(m_rdram[0x1E4D080u + i]);
+                    }
+                    std::cerr << " buf=";
+                    for (uint32_t i = 0; i < 8u; ++i)
+                    {
+                        std::cerr << static_cast<unsigned>(m_rdram[0x1038140u + i]) << ' ';
+                    }
+                    std::cerr << std::dec << '\n';
+                    ++decoderProbeCount;
+                }
+            }
+            if (executingPc == 0x1A23B0u)
+            {
+                static uint32_t streamWriterCallProbe = 0u;
+                if (streamWriterCallProbe < 16u)
+                {
+                    std::cerr << "[probe:stream-writer-call] pc=0x" << std::hex << executingPc
+                              << " sp=0x" << getRegU32(&context, 29)
+                              << " ra=0x" << getRegU32(&context, 31)
+                              << " a0=0x" << getRegU32(&context, 4)
+                              << " a1=0x" << getRegU32(&context, 5)
+                              << " a2=0x" << getRegU32(&context, 6)
+                              << " a3=0x" << getRegU32(&context, 7)
+                              << " s0=0x" << getRegU32(&context, 16)
+                              << " s1=0x" << getRegU32(&context, 17)
+                              << " s2=0x" << getRegU32(&context, 18)
+                              << " s3=0x" << getRegU32(&context, 19)
+                              << " global1021198=0x" << Ps2FastRead32(m_rdram, 0x1021198u)
+                              << std::dec << '\n';
+                    ++streamWriterCallProbe;
+                }
+            }
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
+
+            // Temporary stream-integrity probe.  IOP transfers are exact at
+            // the adapter boundary, so sample the two decoder segments around
+            // every EE entry to identify a later guest writer.  The probe is
+            // deliberately local to this .cpp and uses no generated headers.
+            {
+                constexpr uint32_t kStreamBase = 0x1E4D080u;
+                constexpr uint32_t kSegmentSize = 0x20000u;
+                auto sampleSegment = [&](uint32_t base) {
+                    uint64_t hash = 1469598103934665603ull;
+                    for (uint32_t off = 0u; off < kSegmentSize; off += 0x1000u)
+                    {
+                        for (uint32_t i = 0u; i < 16u; ++i)
+                        {
+                            hash ^= m_rdram[base + off + i];
+                            hash *= 1099511628211ull;
+                        }
+                    }
+                    return hash;
+                };
+                auto hasPrefix = [&](uint32_t base, std::initializer_list<uint8_t> bytes) {
+                    uint32_t i = 0u;
+                    for (uint8_t expected : bytes)
+                    {
+                        if (m_rdram[base + i++] != expected)
+                            return false;
+                    }
+                    return true;
+                };
+                static bool monitorSeg6 = false;
+                static bool monitorSegC = false;
+                static uint64_t previousSeg6 = 0u;
+                static uint64_t previousSegC = 0u;
+                const uint32_t seg6 = kStreamBase + 6u * kSegmentSize;
+                const uint32_t segC = kStreamBase + 0xCu * kSegmentSize;
+                if (!monitorSeg6 && hasPrefix(seg6, {0x04, 0x11, 0xB0, 0xF0, 0x41, 0xA2, 0xFE, 0x02,
+                                                     0x2F, 0x28, 0x24, 0x31, 0x03, 0xAF, 0x43, 0xE8}))
+                {
+                    monitorSeg6 = true;
+                    previousSeg6 = sampleSegment(seg6);
+                    std::cerr << "[probe:stream-monitor] armed seg=6 hash=0x" << std::hex
+                              << previousSeg6 << std::dec << '\n';
+                }
+                if (!monitorSegC && hasPrefix(segC, {0x44, 0x3D, 0x40, 0x01, 0x08, 0xF9, 0x96, 0xD0,
+                                                     0xBF, 0x84, 0xE3, 0x16, 0xD4, 0x22, 0x18, 0xF0}))
+                {
+                    monitorSegC = true;
+                    previousSegC = sampleSegment(segC);
+                    std::cerr << "[probe:stream-monitor] armed seg=c hash=0x" << std::hex
+                              << previousSegC << std::dec << '\n';
+                }
+                if (monitorSeg6)
+                {
+                    const uint64_t current = sampleSegment(seg6);
+                    if (current != previousSeg6)
+                    {
+                        std::cerr << "[probe:stream-modify] seg=6 entry=0x" << std::hex
+                                  << executingPc << " old=0x" << previousSeg6 << " new=0x" << current
+                                  << std::dec << '\n';
+                        previousSeg6 = current;
+                    }
+                }
+                if (monitorSegC)
+                {
+                    const uint64_t current = sampleSegment(segC);
+                    if (current != previousSegC)
+                    {
+                        std::cerr << "[probe:stream-modify] seg=c entry=0x" << std::hex
+                                  << executingPc << " old=0x" << previousSegC << " new=0x" << current
+                                  << std::dec << '\n';
+                        previousSegC = current;
+                    }
+                }
+            }
+            {
+                // Once segment C is present all IOP chunks have arrived.
+                // Hash both complete segments at the function boundary; this
+                // catches writes that sparse sampling can miss and attributes
+                // the change to the next guest entry without touching headers.
+                constexpr uint32_t streamBase = 0x1E4D080u;
+                const uint32_t seg6 = streamBase + 6u * 0x20000u;
+                const uint32_t segC = streamBase + 0xCu * 0x20000u;
+                if (!g_katamariFullMonitorArmed && m_rdram[segC] == 0x44u && m_rdram[segC + 1u] == 0x3Du &&
+                    m_rdram[segC + 2u] == 0x40u && m_rdram[segC + 3u] == 0x01u)
+                {
+                    g_katamariFullMonitorArmed = true;
+                    g_katamariPreviousFull6 = katamariStreamHash(m_rdram, seg6);
+                    g_katamariPreviousFullC = katamariStreamHash(m_rdram, segC);
+                    std::memcpy(g_katamariBaseline6.data(), m_rdram + seg6, g_katamariBaseline6.size());
+                    std::memcpy(g_katamariBaselineC.data(), m_rdram + segC, g_katamariBaselineC.size());
+                    std::cerr << "[probe:stream-full] armed h6=0x" << std::hex << g_katamariPreviousFull6
+                              << " hc=0x" << g_katamariPreviousFullC << std::dec << '\n';
+                }
+            }
             function(m_rdram, &context, &m_runtime);
+            // Temporary Katamari init/task trace.  This is intentionally
+            // scheduler-side (no generated headers or game runtime hooks):
+            // it records every EE entry in the startup/task address bands,
+            // including threads other than the MPEG worker (thread 3).
+            // Keeping it bounded makes the diagnostic cheap enough for the
+            // short probe runs while still exposing missed indirect entries.
+            if ((executingPc >= 0x100000u && executingPc < 0x117000u) ||
+                (executingPc >= 0x149000u && executingPc < 0x154000u) ||
+                (executingPc >= 0x164000u && executingPc < 0x17c000u))
+            {
+                static uint32_t initTraceCount = 0u;
+                if (initTraceCount < 320u)
+                {
+                    std::cerr << "[probe:init-entry] tid=" << running->id
+                              << " entry=0x" << std::hex << executingPc
+                              << " next=0x" << context.pc
+                              << " ra=0x" << getRegU32(&context, 31)
+                              << " a0=0x" << getRegU32(&context, 4)
+                              << " a1=0x" << getRegU32(&context, 5)
+                              << " status=" << static_cast<unsigned>(running->status)
+                              << " tasks=0x" << Ps2FastRead32(m_rdram, 0x101BDD0u)
+                              << std::dec << '\n';
+                    ++initTraceCount;
+                }
+            }
+            if (executingPc == 0x1675f8u || (executingPc >= 0x167800u && executingPc < 0x167910u))
+            {
+                static uint32_t bootStateSnapshotCount = 0u;
+                if (bootStateSnapshotCount++ < 24u)
+                {
+                    const uint32_t task = Ps2FastRead32(m_rdram, 0x101BDD0u) & PS2_RAM_MASK;
+                    std::cerr << "[probe:boot-snapshot] pc=0x" << std::hex << context.pc
+                              << " task14=0x" << Ps2FastRead32(m_rdram, task + 0x14u)
+                              << " busy=0x" << static_cast<unsigned>(m_rdram[0x101DB77u])
+                              << " g5611c0=0x" << Ps2FastRead32(m_rdram, 0x5611C0u)
+                              << " g5611d0=0x" << Ps2FastRead32(m_rdram, 0x5611D0u)
+                              << " g5611e0=0x" << Ps2FastRead32(m_rdram, 0x5611E0u)
+                              << " g5611e4=0x" << Ps2FastRead32(m_rdram, 0x5611E4u)
+                              << " g5611e8=0x" << Ps2FastRead32(m_rdram, 0x5611E8u)
+                              << " g5611ec=0x" << Ps2FastRead32(m_rdram, 0x5611ECu)
+                              << " decAC=0x" << static_cast<unsigned>(m_rdram[0x101D42Cu])
+                              << " decAD=0x" << static_cast<unsigned>(m_rdram[0x101D42Du])
+                              << " decA8=0x" << static_cast<unsigned>(m_rdram[0x101D428u])
+                              << " decA9=0x" << static_cast<unsigned>(m_rdram[0x101D429u])
+                              << " decAA=0x" << Ps2FastRead16(m_rdram, 0x101D42Au)
+                              << " decRemain=0x" << Ps2FastRead32(m_rdram, 0x101D448u)
+                              << " decOut=0x" << Ps2FastRead32(m_rdram, 0x101D44Cu)
+                              << " decSrc=0x" << Ps2FastRead32(m_rdram, 0x101D450u)
+                              << " decEnd=0x" << Ps2FastRead32(m_rdram, 0x101D454u)
+                              << " stream=0x" << Ps2FastRead32(m_rdram, 0x4A9E4Cu)
+                              << std::dec << '\n';
+                }
+            }
+            if (executingPc == 0x167620u || executingPc == 0x167800u || executingPc == 0x167908u)
+            {
+                static uint32_t taskListProbeCount = 0u;
+                if (taskListProbeCount < 48u)
+                {
+                    const uint32_t head = Ps2FastRead32(m_rdram, 0x101BDD0u) & PS2_RAM_MASK;
+                    const uint32_t first = head < PS2_RAM_SIZE ? Ps2FastRead32(m_rdram, head + 0x14u) : 0u;
+                    const uint32_t second = first < PS2_RAM_SIZE ? Ps2FastRead32(m_rdram, first + 0x04u) : 0u;
+                    const uint32_t third = first < PS2_RAM_SIZE ? Ps2FastRead32(m_rdram, first + 0x08u) : 0u;
+                    std::cerr << "[probe:task-list] pc=0x" << std::hex << executingPc
+                              << " head=0x" << head << " head14=0x" << Ps2FastRead32(m_rdram, head + 0x14u)
+                              << " item=0x" << first << " cb=0x" << second << " next=0x" << third
+                              << " g5611c0=0x" << Ps2FastRead32(m_rdram, 0x5611C0u)
+                              << " g5611cc=0x" << static_cast<unsigned>(m_rdram[0x5611CCu])
+                              << std::dec << '\n';
+                    ++taskListProbeCount;
+                }
+            }
+            if (running->id == 3 && executingPc >= 0x188078u && executingPc <= 0x1880B4u)
+            {
+                static uint32_t decoderNormalProgressProbeCount = 0u;
+                if ((decoderNormalProgressProbeCount++ % 1000u) == 0u)
+                {
+                    std::cerr << "[probe:decoder-progress] pc=0x" << std::hex << executingPc
+                              << " next=0x" << context.pc
+                              << " remaining=0x" << getRegU32(&context, 19)
+                              << " out=0x" << getRegU32(&context, 20)
+                              << " src=0x" << getRegU32(&context, 21)
+                              << " words=0x" << getRegU32(&context, 17)
+                              << " bitpos=0x" << getRegU32(&context, 22)
+                              << " bits=0x" << getRegU32(&context, 18)
+                              << " state10=0x" << Ps2FastRead32(m_rdram, 0x101D450u)
+                              << " state1e=0x" << static_cast<unsigned>(m_rdram[0x101D45Eu])
+                              << std::dec << '\n';
+                }
+            }
+            if (running->id == 3)
+            {
+                static uint32_t decoderAfterBoundaryProbeCount = 0u;
+                if (decoderAfterBoundaryProbeCount < 160u)
+                {
+                    std::cerr << "[probe:decoder-after-boundary] pc=0x" << std::hex << executingPc
+                              << " next=0x" << context.pc
+                              << " state10=0x" << Ps2FastRead32(m_rdram, 0x101D450u)
+                              << " state14=0x" << Ps2FastRead32(m_rdram, 0x101D454u)
+                              << " state1c=0x" << Ps2FastRead16(m_rdram, 0x101D45Cu)
+                              << " status=0x" << static_cast<unsigned>(m_rdram[0x101D45Eu])
+                              << std::dec << '\n';
+                    ++decoderAfterBoundaryProbeCount;
+                }
+            }
+            {
+                constexpr uint32_t streamBase = 0x1E4D080u;
+                const uint32_t seg6 = streamBase + 6u * 0x20000u;
+                const uint32_t segC = streamBase + 0xCu * 0x20000u;
+                // Full-segment hashing is diagnostic only; sample sparsely so
+                // the probe does not dominate guest execution time.
+                static uint32_t fullMonitorSampleCounter = 0u;
+                const bool sampleFullMonitor = ((fullMonitorSampleCounter++ & 0x3FFu) == 0u);
+                if (g_katamariFullMonitorArmed && sampleFullMonitor)
+                {
+                    const uint64_t current6 = katamariStreamHash(m_rdram, seg6);
+                    const uint64_t currentC = katamariStreamHash(m_rdram, segC);
+                    if (current6 != g_katamariPreviousFull6 || currentC != g_katamariPreviousFullC)
+                    {
+                        std::cerr << "[probe:stream-full-change-after] entry=0x" << std::hex
+                                  << executingPc << " h6=0x" << current6 << " hc=0x" << currentC
+                                  << " prev6=0x" << g_katamariPreviousFull6 << " prevc=0x" << g_katamariPreviousFullC
+                                  << std::dec;
+                        uint32_t differences = 0u;
+                        for (uint32_t i = 0u; i < 0x20000u && differences < 16u; ++i)
+                        {
+                            if (m_rdram[seg6 + i] != g_katamariBaseline6[i])
+                            {
+                                std::cerr << " seg6+0x" << std::hex << i << ":"
+                                          << static_cast<unsigned>(g_katamariBaseline6[i]) << ">"
+                                          << static_cast<unsigned>(m_rdram[seg6 + i]);
+                                ++differences;
+                            }
+                        }
+                        differences = 0u;
+                        for (uint32_t i = 0u; i < 0x20000u && differences < 16u; ++i)
+                        {
+                            if (m_rdram[segC + i] != g_katamariBaselineC[i])
+                            {
+                                std::cerr << " segc+0x" << std::hex << i << ":"
+                                          << static_cast<unsigned>(g_katamariBaselineC[i]) << ">"
+                                          << static_cast<unsigned>(m_rdram[segC + i]);
+                                ++differences;
+                            }
+                        }
+                        std::cerr << std::dec << '\n';
+                        std::memcpy(g_katamariBaseline6.data(), m_rdram + seg6, g_katamariBaseline6.size());
+                        std::memcpy(g_katamariBaselineC.data(), m_rdram + segC, g_katamariBaselineC.size());
+                        g_katamariPreviousFull6 = current6;
+                        g_katamariPreviousFullC = currentC;
+                    }
+                }
+            }
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
+            if (executingPc == 0x188010u || executingPc == 0x188028u || executingPc == 0x188034u)
+            {
+                static uint32_t decoderReturnProbeCount = 0u;
+                if (decoderReturnProbeCount < 96u)
+                {
+                    std::cerr << "[probe:decoder-return] entry=0x" << std::hex << executingPc
+                              << " pc=0x" << context.pc
+                              << " state+08=0x" << Ps2FastRead32(m_rdram, 0x101D448u)
+                              << " +0c=0x" << Ps2FastRead32(m_rdram, 0x101D44Cu)
+                              << " +10=0x" << Ps2FastRead32(m_rdram, 0x101D450u)
+                              << " +14=0x" << Ps2FastRead32(m_rdram, 0x101D454u)
+                              << " +1e=0x" << static_cast<unsigned>(m_rdram[0x101D45Eu])
+                              << std::dec << '\n';
+                    ++decoderReturnProbeCount;
+                }
+            }
+            if (context.pc == 0x54DAC0u)
+            {
+                std::cerr << "[probe:function54] fn=0x" << std::hex << executingPc
+                          << " ra=0x" << getRegU32(&context, 31)
+                          << " sp=0x" << getRegU32(&context, 29) << std::dec << std::endl;
+            }
         }
         catch (const EeDispatcherTransfer &)
         {
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
+            if (running->id == 3 && executingPc >= 0x188078u && executingPc <= 0x1880B4u)
+            {
+                static uint32_t decoderProgressProbeCount = 0u;
+                if ((decoderProgressProbeCount++ % 256u) == 0u)
+                {
+                    std::cerr << "[probe:decoder-progress] pc=0x" << std::hex << executingPc
+                              << " next=0x" << context.pc
+                              << " remaining=0x" << getRegU32(&context, 19)
+                              << " out=0x" << getRegU32(&context, 20)
+                              << " src=0x" << getRegU32(&context, 21)
+                              << " words=0x" << getRegU32(&context, 17)
+                              << " bitpos=0x" << getRegU32(&context, 22)
+                              << " bits=0x" << getRegU32(&context, 18)
+                              << " state10=0x" << Ps2FastRead32(m_rdram, 0x101D450u)
+                              << " state1e=0x" << static_cast<unsigned>(m_rdram[0x101D45Eu])
+                              << std::dec << '\n';
+                }
+            }
+            if (executingPc == 0x188010u || executingPc == 0x188028u || executingPc == 0x188034u)
+            {
+                static uint32_t decoderTransferProbeCount = 0u;
+                if (decoderTransferProbeCount < 96u)
+                {
+                        std::cerr << "[probe:decoder-transfer] entry=0x" << std::hex << executingPc
+                              << " pc=0x" << context.pc << " tid=" << running->id
+                              << " status=" << static_cast<int>(running->status)
+                              << " ra=0x" << getRegU32(&context, 31)
+                              << " invocations=" << running->invocations.size()
+                              << " state+10=0x" << Ps2FastRead32(m_rdram, 0x101D450u)
+                              << " state+1e=0x" << static_cast<unsigned>(m_rdram[0x101D45Eu])
+                              << " out=";
+                    for (uint32_t i = 0; i < 16u; ++i)
+                    {
+                        std::cerr << (i == 0u ? "" : " ")
+                                  << static_cast<unsigned>(m_rdram[0x1038140u + i]);
+                    }
+                    std::cerr << " out64=0x" << Ps2FastRead64(m_rdram, 0x1038140u)
+                              << std::dec << '\n';
+                    ++decoderTransferProbeCount;
+                }
+            }
         }
         catch (...)
         {
@@ -414,13 +919,21 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
     target->stack = stack;
     target->stackSize = stackSize;
     target->gp = gp;
+    if (stack != 0u && stack < PS2_RAM_SIZE)
+    {
+        std::lock_guard<std::mutex> lock(m_runtime.m_asyncCallbackStackMutex);
+        m_runtime.m_asyncCallbackStackTop = std::min(m_runtime.m_asyncCallbackStackTop,
+                                                      stack & ~(16u - 1u));
+    }
     publishSnapshot();
 }
 
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();
-    if (params.priority < 1 || params.priority >= kPriorityCount)
+    // Priority zero is reserved for the kernel's internal top thread
+    // (PS2SDK's InitThread creates it with initial_priority = 0).
+    if (params.priority < 0 || params.priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -660,6 +1173,20 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
     {
         return KE_UNKNOWN_THID;
     }
+    if (id == 3)
+    {
+        static uint32_t wakeProbeCount = 0u;
+        if (wakeProbeCount < 32u)
+        {
+            std::cerr << "[probe:decoder-wakeup] id=3 current=" << m_currentThreadId
+                      << " status=" << static_cast<int>(target->status)
+                      << " wait=" << static_cast<int>(target->wait.reason)
+                      << " wakeCount=" << target->wakeupCount
+                      << " pc=0x" << std::hex << target->context.pc
+                      << std::dec << '\n';
+            ++wakeProbeCount;
+        }
+    }
     if (target->status == EeThreadStatus::Dormant)
     {
         return KE_DORMANT;
@@ -867,6 +1394,18 @@ int EeScheduler::signalSemaphore(int id, bool interruptSafe)
     if (!object)
     {
         return KE_UNKNOWN_SEMID;
+    }
+    // THROWAWAY-DIAGNOSTIC: who signals the boot semaphore.
+    {
+        static uint32_t semaSignalProbeCount = 0u;
+        if (semaSignalProbeCount < 400u)
+        {
+            std::cerr << "[probe:sema-signal] id=" << id
+                      << " count=" << object->count
+                      << " waiters=" << object->waiters.size()
+                      << " current=" << m_currentThreadId << '\n';
+            ++semaSignalProbeCount;
+        }
     }
     if (!object->waiters.empty())
     {
@@ -1098,6 +1637,25 @@ int EeScheduler::cancelAlarm(int id)
 void EeScheduler::queueInvocation(GuestInvocation invocation)
 {
     assertExecutor();
+    // Interrupt sources are level-triggered from the emulated hardware.  If
+    // an identical handler is already waiting for delivery, coalesce the
+    // edge instead of building an unbounded backlog that can starve ready EE
+    // threads (and, for callback-owned stacks, force needless re-entry).
+    if (invocation.kind == GuestInvocationKind::Interrupt)
+    {
+        const bool alreadyPending = std::any_of(
+            m_pendingInvocations.begin(), m_pendingInvocations.end(),
+            [&invocation](const GuestInvocation &pending)
+            {
+                return pending.kind == GuestInvocationKind::Interrupt &&
+                       pending.context.pc == invocation.context.pc &&
+                       pending.tag == invocation.tag;
+            });
+        if (alreadyPending)
+        {
+            return;
+        }
+    }
     invocation.sequence = ++m_invocationSequence;
     m_pendingInvocations.push_back(std::move(invocation));
     m_checkpointPending.store(true, std::memory_order_release);
@@ -1108,7 +1666,20 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     assertExecutor();
     GuestThread *owner = currentThread();
     assert(owner != nullptr);
-    if (getRegU32(&invocation.context, 29) == 0u)
+    {
+        static uint32_t invokeProbeCount = 0u;
+        if (invokeProbeCount < 128u)
+        {
+            std::cerr << "[probe:invoke-current] owner=" << owner->id
+                      << " depth=" << owner->invocations.size()
+                      << " kind=" << static_cast<unsigned>(invocation.kind)
+                      << " pc=0x" << std::hex << invocation.context.pc
+                      << " tag=0x" << invocation.tag << std::dec << '\n';
+            ++invokeProbeCount;
+        }
+    }
+    if (invocation.kind == GuestInvocationKind::Interrupt ||
+        getRegU32(&invocation.context, 29) == 0u)
     {
         SET_GPR_U32(&invocation.context, 29, invocationStackTop());
     }
@@ -1123,10 +1694,21 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     assertExecutor();
     GuestThread *owner = currentThread();
     assert(owner != nullptr);
+    {
+        static uint32_t invokeSequenceProbeCount = 0u;
+        if (invokeSequenceProbeCount < 96u)
+        {
+            std::cerr << "[probe:invoke-sequence] owner=" << owner->id
+                      << " depth=" << owner->invocations.size()
+                      << " count=" << invocations.size() << std::dec << '\n';
+            ++invokeSequenceProbeCount;
+        }
+    }
     assert(!invocations.empty());
     for (auto it = invocations.rbegin(); it != invocations.rend(); ++it)
     {
-        if (getRegU32(&it->context, 29) == 0u)
+        if (it->kind == GuestInvocationKind::Interrupt ||
+            getRegU32(&it->context, 29) == 0u)
         {
             SET_GPR_U32(&it->context, 29, invocationStackTop());
         }
@@ -1160,6 +1742,17 @@ uint32_t EeScheduler::invocationStackTop()
         throw std::logic_error("EE invocation stack requested without a current guest context");
     }
     const size_t depth = owner ? owner->invocations.size() : 0u;
+    {
+        static uint32_t invocationStackProbeCount = 0u;
+        if (invocationStackProbeCount < 96u)
+        {
+            std::cerr << "[probe:invocation-stack] owner=" << owner->id
+                      << " depth=" << depth
+                      << " activePc=0x" << std::hex << owner->activeContext().pc
+                      << std::dec << '\n';
+            ++invocationStackProbeCount;
+        }
+    }
     const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(owner->id)) << 32u) |
                          static_cast<uint32_t>(depth);
     const auto existing = m_invocationStackTops.find(key);
@@ -1251,6 +1844,10 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
 
 void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
 {
+    if (m_executorThread == std::thread::id{})
+    {
+        m_executorThread = std::this_thread::get_id();
+    }
     assertExecutor();
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
     if (cause < 32u && (mask & (1u << cause)) == 0u)
@@ -1270,6 +1867,22 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
               { return left.order < right.order; });
+    if (dmac && cause == 5u)
+    {
+        static uint32_t sif0DispatchProbeCount = 0u;
+        if (sif0DispatchProbeCount++ < 256u)
+        {
+            std::cerr << "[probe:sif0-dispatch] handlers=" << matching.size()
+                      << " enabled=1 running=" << m_running.load(std::memory_order_relaxed)
+                      << " current=" << (currentThread() ? currentThread()->id : -1)
+                      << " inside=" << m_insideInterrupt
+                      << " depth=" << (currentThread() ? currentThread()->invocations.size() : 0u)
+                      << " first=0x" << std::hex
+                      << (matching.empty() ? 0u : matching.front().handler)
+                      << std::dec
+                      << '\n';
+        }
+    }
     for (const EeIrqHandler &handler : matching)
     {
         GuestInvocation invocation{};
@@ -1278,9 +1891,71 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
         SET_GPR_U32(&invocation.context, 4, cause);
         SET_GPR_U32(&invocation.context, 5, handler.argument);
         SET_GPR_U32(&invocation.context, 28, handler.gp);
-        SET_GPR_U32(&invocation.context, 29, handler.sp);
+        SET_GPR_U32(&invocation.context, 29, 0u);
         SET_GPR_U32(&invocation.context, 31, 0u);
         queueInvocation(std::move(invocation));
+    }
+}
+
+void EeScheduler::dispatchIrqNow(bool dmac, uint32_t cause)
+{
+    if (m_executorThread == std::thread::id{})
+    {
+        m_executorThread = std::this_thread::get_id();
+    }
+    assertExecutor();
+    const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
+    if (cause < 32u && (mask & (1u << cause)) == 0u)
+    {
+        return;
+    }
+    const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
+    std::vector<EeIrqHandler> matching;
+    for (const auto &[id, handler] : handlers)
+    {
+        (void)id;
+        if (handler.enabled && handler.cause == cause && handler.handler != 0u &&
+            m_runtime.hasFunction(handler.handler))
+        {
+            matching.push_back(handler);
+        }
+    }
+    std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
+              { return left.order < right.order; });
+    std::vector<GuestInvocation> invocations;
+    invocations.reserve(matching.size());
+    for (const EeIrqHandler &handler : matching)
+    {
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::Interrupt;
+        invocation.context.pc = handler.handler;
+        SET_GPR_U32(&invocation.context, 4, cause);
+        SET_GPR_U32(&invocation.context, 5, handler.argument);
+        SET_GPR_U32(&invocation.context, 28, handler.gp);
+        SET_GPR_U32(&invocation.context, 29, 0u);
+        SET_GPR_U32(&invocation.context, 31, 0u);
+        invocations.push_back(std::move(invocation));
+    }
+    if (invocations.empty())
+    {
+        return;
+    }
+
+    // A completion raised while an invocation is active must remain pending
+    // until that frame returns.  Checking the stack itself is more robust than
+    // relying only on the cached interrupt flag: callbacks can raise another
+    // IRQ from inside generated code before the next scheduler boundary.
+    if (m_running.load(std::memory_order_acquire) && currentThread() &&
+        !m_insideInterrupt && currentThread()->invocations.empty())
+    {
+        invokeCurrentSequence(std::move(invocations));
+    }
+    else
+    {
+        for (GuestInvocation &invocation : invocations)
+        {
+            queueInvocation(std::move(invocation));
+        }
     }
 }
 
@@ -1453,7 +2128,7 @@ uint8_t *EeScheduler::rdram() const noexcept
 
 void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
 {
-    if (m_executorThread == std::thread::id{})
+    if (m_executorThread == std::thread::id{} || m_threads.empty())
     {
         reset(rdram, ctx);
         GuestThread *main = selectReady();
@@ -1497,6 +2172,8 @@ void EeScheduler::publishSnapshot()
         EeThreadSnapshot snapshot{};
         snapshot.id = id;
         snapshot.pc = item.activeContext().pc;
+        snapshot.ra = getRegU32(&item.activeContext(), 31);
+        snapshot.sp = getRegU32(&item.activeContext(), 29);
         snapshot.entry = item.entry;
         snapshot.stack = item.stack;
         snapshot.stackSize = item.stackSize;
@@ -1628,12 +2305,45 @@ void EeScheduler::makeRunning(GuestThread &item)
     item.status = EeThreadStatus::Running;
     m_currentThreadId = item.id;
     renewTimeSlice();
+    // TEMP-EXPERIMENT: thread run census. Revert.
+    {
+        static std::array<uint64_t, 16> runCounts{};
+        static uint64_t totalRuns = 0;
+        if (item.id >= 0 && item.id < 16)
+            runCounts[static_cast<size_t>(item.id)]++;
+        ++totalRuns;
+        if (totalRuns <= 40u)
+        {
+            std::cerr << "[thsched] run#" << totalRuns << " t=" << item.id
+                      << " pc=0x" << std::hex << item.activeContext().pc << std::dec << std::endl;
+        }
+        if (totalRuns % 20000u == 0u)
+        {
+            std::cerr << "[thsched] total=" << totalRuns << " runs:";
+            for (size_t i = 0; i < 8; ++i)
+                std::cerr << " t" << i << "=" << runCounts[i];
+            std::cerr << " pc=0x" << std::hex << item.activeContext().pc << std::dec << std::endl;
+        }
+    }
 }
 
 void EeScheduler::makeDormant(GuestThread &item)
 {
     removeReady(item);
     removeFromWaitObject(item);
+    if (item.id == 3)
+    {
+        static uint32_t dormantProbeCount = 0u;
+        if (dormantProbeCount < 24u)
+        {
+            std::cerr << "[probe:decoder-dormant] pc=0x" << std::hex
+                      << item.context.pc << " status=" << static_cast<int>(item.status)
+                      << " ra=0x" << getRegU32(&item.context, 31)
+                      << " invocations=" << item.invocations.size()
+                      << std::dec << '\n';
+            ++dormantProbeCount;
+        }
+    }
     item.status = EeThreadStatus::Dormant;
     item.wait = {};
     item.resumeCompletion = {};
@@ -1676,6 +2386,50 @@ void EeScheduler::blockCurrent(EeWaitState wait)
 {
     GuestThread *self = currentThread();
     assert(self != nullptr);
+    // TEMP-EXPERIMENT: trace thread1 waits. Revert.
+    if (self->id == 1)
+    {
+        static uint32_t t1block = 0u;
+        if (t1block < 24u)
+        {
+            ++t1block;
+            std::cerr << "[probe:t1-block] n=" << t1block << " pc=0x" << std::hex
+                      << self->context.pc << " ra=0x"
+                      << (uint32_t)_mm_extract_epi32(self->context.r[31], 0)
+                      << " reason=" << std::dec << static_cast<int>(wait.reason)
+                      << std::endl;
+        }
+    }
+    if (self->id == 3 || self->id == 4)
+    {
+        static uint32_t blockProbeCount = 0u;
+        if (blockProbeCount < 48u)
+        {
+            std::cerr << "[probe:decoder-block] id=" << self->id << " pc=0x" << std::hex
+                      << self->context.pc << " reason=" << static_cast<int>(wait.reason)
+                      << " s1=0x" << ((uint64_t)(uint32_t)_mm_extract_epi32(self->context.r[17], 1) << 32 | (uint64_t)(uint32_t)_mm_extract_epi32(self->context.r[17], 0))
+                      << " s3=0x" << ((uint64_t)(uint32_t)_mm_extract_epi32(self->context.r[19], 1) << 32 | (uint64_t)(uint32_t)_mm_extract_epi32(self->context.r[19], 0))
+                      << " s4=0x" << ((uint64_t)(uint32_t)_mm_extract_epi32(self->context.r[20], 1) << 32 | (uint64_t)(uint32_t)_mm_extract_epi32(self->context.r[20], 0))
+                      << " s5=0x" << ((uint64_t)(uint32_t)_mm_extract_epi32(self->context.r[21], 1) << 32 | (uint64_t)(uint32_t)_mm_extract_epi32(self->context.r[21], 0))
+                      << " s6=0x" << ((uint64_t)(uint32_t)_mm_extract_epi32(self->context.r[22], 1) << 32 | (uint64_t)(uint32_t)_mm_extract_epi32(self->context.r[22], 0))
+                      << " s7=0x" << ((uint64_t)(uint32_t)_mm_extract_epi32(self->context.r[23], 1) << 32 | (uint64_t)(uint32_t)_mm_extract_epi32(self->context.r[23], 0))
+                      << std::dec << '\n';
+            ++blockProbeCount;
+        }
+    }
+    else
+    {
+        static uint32_t blockOtherProbeCount = 0u;
+        if (blockOtherProbeCount < 400u)
+        {
+            std::cerr << "[probe:thread-block] id=" << self->id << " pc=0x" << std::hex
+                      << self->context.pc << " reason=" << static_cast<int>(wait.reason)
+                      << " ra=0x" << getRegU32(&self->context, 31)
+                      << " a0=0x" << getRegU32(&self->context, 4)
+                      << std::dec << '\n';
+            ++blockOtherProbeCount;
+        }
+    }
     self->wait = std::move(wait);
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
     m_currentThreadId = 0;
@@ -1860,6 +2614,16 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
+        // TEMP-EXPERIMENT: prove scheduler VBlank fires. Revert.
+        {
+            static int vblankSched = 0;
+            if (vblankSched < 3)
+            {
+                ++vblankSched;
+                std::cerr << "[vblank-sched] n=" << vblankSched << " tick=" << m_vsyncTick
+                          << std::endl;
+            }
+        }
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
         {
@@ -1881,6 +2645,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         m_vsyncFlagAddress = 0u;
         m_vsyncTickAddress = 0u;
         completeVSync(m_vsyncTick);
+        m_runtime.notifyIopVBlank();
         if (m_gsVSyncCallback != 0u && m_runtime.hasFunction(m_gsVSyncCallback))
         {
             GuestInvocation invocation{};

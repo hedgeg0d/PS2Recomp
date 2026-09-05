@@ -1,5 +1,7 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 
 namespace
@@ -121,5 +123,59 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
+
+    // TEMP-EXPERIMENT PS2X_PAD_SCRIPT="L<a>-<b>,X<c>-<d>,S<e>-<f>" wall-seconds.
+    // Scripted pad input for headless runs (mc-dialog needs LEFT then
+    // CROSS, title needs START). Revert before contribution.
+    if (const char *script = std::getenv("PS2X_PAD_SCRIPT"))
+    {
+        static const auto t0 = std::chrono::steady_clock::now();
+        const double t =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        uint16_t held = 0u;
+        for (const char *p = script; *p;)
+        {
+            const bool isLeft = (*p == 'L');
+            const bool isCross = (*p == 'X');
+            const bool isStart = (*p == 'S');
+            ++p;
+            char *end = nullptr;
+            const double a = std::strtod(p, &end);
+            if (end == p || *end != '-')
+            {
+                break;
+            }
+            p = end + 1;
+            const double b = std::strtod(p, &end);
+            if (end == p)
+            {
+                break;
+            }
+            p = end;
+            if (*p == ',')
+            {
+                ++p;
+            }
+            if (t >= a && t <= b)
+            {
+                if (isLeft)
+                {
+                    held |= PAD_LEFT;
+                }
+                if (isCross)
+                {
+                    held |= PAD_CROSS;
+                }
+                if (isStart)
+                {
+                    held |= PAD_START;
+                }
+            }
+        }
+        uint16_t live = static_cast<uint16_t>(data[2] | (data[3] << 8));
+        live &= static_cast<uint16_t>(~held);
+        data[2] = static_cast<uint8_t>(live & 0xFF);
+        data[3] = static_cast<uint8_t>(live >> 8);
+    }
     return true;
 }

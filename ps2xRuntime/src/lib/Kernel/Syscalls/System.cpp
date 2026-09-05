@@ -428,6 +428,20 @@ namespace ps2_syscalls
             return true;
         }
 
+        // Interrupt callbacks execute on a bounded guest invocation frame.
+        // Running a syscall override by pushing another invocation from that
+        // frame can recursively consume one 16 KiB callback stack per IRQ
+        // (several retail SDK callbacks query thread state this way).  The
+        // kernel's interrupt-safe syscall path is synchronous, so preserve
+        // that semantic and execute the override in the active frame.
+        if (const GuestThread *current = scheduler.currentThread();
+            current && !current->invocations.empty() &&
+            current->invocations.back().kind == GuestInvocationKind::Interrupt)
+        {
+            runtime->lookupFunction(handler)(rdram, ctx, runtime);
+            return true;
+        }
+
         GuestInvocation invocation{};
         invocation.kind = GuestInvocationKind::SyscallOverride;
         invocation.tag = syscallNumber;
@@ -482,6 +496,14 @@ namespace ps2_syscalls
     {
         const uint32_t syscallIndex = getRegU32(ctx, 4);
         const uint32_t handler = getRegU32(ctx, 5);
+        static uint32_t setSyscallProbeCount = 0u;
+        if (setSyscallProbeCount < 64u)
+        {
+            std::cerr << "[probe:set-syscall] index=0x" << std::hex << syscallIndex
+                      << " handler=0x" << handler
+                      << " pc=0x" << ctx->pc << std::dec << '\n';
+            ++setSyscallProbeCount;
+        }
         runtime->setEeSyscallOverride(rdram, syscallIndex, handler);
 
         setReturnS32(ctx, 0);

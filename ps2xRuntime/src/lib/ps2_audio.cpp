@@ -141,13 +141,18 @@ void PS2AudioBackend::onVagTransferFromBuffer(const uint8_t *data, uint32_t size
 namespace
 {
     constexpr uint32_t LIBSD_CMD_SET_VOICE = 0x8010u;
+    // PS2LIB_Sound forwards its RPCs to the same host audio endpoint as
+    // libsd. Accept both public middleware SIDs here; command decoding still
+    // remains gated by the libsd voice command IDs below.
+    constexpr uint32_t PS2LIB_SOUND_SID = 0x00010001u;
+    constexpr uint32_t LIBSD_SID = 0x80000701u;
 }
 
 void PS2AudioBackend::onSoundCommand(uint32_t sid, uint32_t rpcNum,
                                      const uint8_t *sendBuf, uint32_t sendSize,
                                      uint8_t *recvBuf, uint32_t recvSize)
 {
-    if (sid != 0x80000701u)
+    if (sid != LIBSD_SID && sid != PS2LIB_SOUND_SID)
         return;
 
     if ((rpcNum == LIBSD_CMD_SET_VOICE || (rpcNum & 0xFF00u) == 0x8100u) &&

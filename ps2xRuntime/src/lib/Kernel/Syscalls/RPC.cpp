@@ -290,23 +290,6 @@ namespace ps2_syscalls
             g_rpc_clients[clientPtr].sid = rpcId;
         }
 
-        if (!serverPtr)
-        {
-            // Allocate a dummy server so bind loops can proceed.
-            serverPtr = rpcAllocServerAddr(rdram);
-            if (serverPtr)
-            {
-                t_SifRpcServerData *dummy = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr));
-                if (dummy)
-                {
-                    std::memset(dummy, 0, sizeof(*dummy));
-                    dummy->sid = static_cast<int>(rpcId);
-                }
-                std::lock_guard<std::mutex> lock(g_rpc_mutex);
-                g_rpc_servers[rpcId] = {rpcId, serverPtr};
-            }
-        }
-
         if (serverPtr)
         {
             t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr));
@@ -328,6 +311,18 @@ namespace ps2_syscalls
         event.mode = mode;
         event.result = 0;
         pushSifRpcDebugEvent(event);
+        // TEMP-EXPERIMENT: list every SIF bind to find libmc's MCMAN sid. Revert.
+        {
+            static int bindCount = 0;
+            if (bindCount < 80)
+            {
+                ++bindCount;
+                std::printf("[sifbind] n=%d sid=0x%08x mode=%u server=0x%08x pc=0x%08x ra=0x%08x\n",
+                            bindCount, rpcId, mode, serverPtr,
+                            ctx ? ctx->pc : 0u, ctx ? getRegU32(ctx, 31) : 0u);
+                std::fflush(stdout);
+            }
+        }
         setReturnS32(ctx, 0);
     }
 
@@ -401,6 +396,16 @@ namespace ps2_syscalls
             if (clientIt != g_rpc_clients.end())
             {
                 sidHint = clientIt->second.sid;
+            }
+        }
+        {
+            static uint32_t rpcCallProbeCount = 0u;
+            if (rpcCallProbeCount++ < 256u)
+            {
+                std::cerr << "[probe:rpc-call] sid=0x" << std::hex << sidHint
+                          << " rpc=0x" << rpcNum << " mode=0x" << mode
+                          << " client=0x" << clientPtr << " pc=0x" << (ctx ? ctx->pc : 0u)
+                          << std::dec << '\n';
             }
         }
 
@@ -654,6 +659,14 @@ namespace ps2_syscalls
             }
             if (!runtime->hasFunction(callbackFunction))
             {
+                static uint32_t rpcCallbackDropProbeCount = 0u;
+                if (rpcCallbackDropProbeCount++ < 32u)
+                {
+                    std::cerr << "[probe:rpc-callback-drop] sid=0x" << std::hex << sid
+                              << " rpc=0x" << rpcNum << " endFunc=0x" << endFunction
+                              << " fixed=0x" << callbackFunction
+                              << " pc=0x" << (ctx ? ctx->pc : 0u) << std::dec << '\n';
+                }
                 (void)signalRpcCompletionSema(runtime, completionSemaphore);
                 completeClient(parent, false);
                 return;
@@ -794,6 +807,16 @@ namespace ps2_syscalls
         }
 
         RUNTIME_LOG("[SifRegisterRpc] sid=0x" << std::hex << sid << " sd=0x" << sdPtr << std::dec);
+        {
+            static uint32_t rpcServerProbeCount = 0u;
+            if (rpcServerProbeCount++ < 32u)
+            {
+                std::cerr << "[probe:rpc-server] sid=0x" << std::hex << sid
+                          << " func=0x" << func << " buf=0x" << buf
+                          << " cfunc=0x" << cfunc << " pc=0x" << (ctx ? ctx->pc : 0u)
+                          << std::dec << '\n';
+            }
+        }
         SifRpcDebugEvent event = makeRpcDebugEvent("RegisterRpc", ctx, runtime);
         event.serverPtr = sdPtr;
         event.sid = sid;
@@ -966,12 +989,11 @@ namespace ps2_syscalls
         uint32_t packetAddr = getRegU32(ctx, 5);
         uint32_t packetSize = getRegU32(ctx, 6);
         uint32_t srcExtra = getRegU32(ctx, 7);
-
-        uint32_t sp = getRegU32(ctx, 29);
-        uint32_t destExtra = 0;
-        uint32_t sizeExtra = 0;
-        readStackU32(rdram, sp, 0x10, destExtra);
-        readStackU32(rdram, sp, 0x14, sizeExtra);
+        // sceSifSendCmd has six integer arguments.  The fifth and sixth are
+        // still inside the EE's eight-register argument window, so they are
+        // supplied in $t0/$t1 rather than the caller's stack frame.
+        uint32_t destExtra = getRegU32(ctx, 8);
+        uint32_t sizeExtra = getRegU32(ctx, 9);
 
         if (sizeExtra > 0 && srcExtra && destExtra)
         {

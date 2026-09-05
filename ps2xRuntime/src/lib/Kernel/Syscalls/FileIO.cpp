@@ -448,9 +448,8 @@ namespace ps2_syscalls
 
     void fioGetstat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        // we wont implement this for now.
-        uint32_t pathAddr = getRegU32(ctx, 4);    // $a0
-        uint32_t statBufAddr = getRegU32(ctx, 5); // $a1
+        const uint32_t pathAddr = getRegU32(ctx, 4);    // $a0
+        const uint32_t statBufAddr = getRegU32(ctx, 5); // $a1
 
         const char *ps2Path = reinterpret_cast<const char *>(getConstMemPtr(rdram, pathAddr));
         uint8_t *ps2StatBuf = getMemPtr(rdram, statBufAddr);
@@ -461,7 +460,9 @@ namespace ps2_syscalls
             setReturnS32(ctx, -1);
             return;
         }
-        if (!ps2StatBuf)
+        if (!ps2StatBuf ||
+            statBufAddr > std::numeric_limits<uint32_t>::max() - (sizeof(io_stat_t) - 1u) ||
+            !getMemPtr(rdram, statBufAddr + static_cast<uint32_t>(sizeof(io_stat_t) - 1u)))
         {
             std::cerr << "fioGetstat error: Invalid buffer addr" << std::endl;
             setReturnS32(ctx, -1);
@@ -476,7 +477,30 @@ namespace ps2_syscalls
             return;
         }
 
-        setReturnS32(ctx, -1);
+        std::error_code ec;
+        const std::filesystem::file_status status = std::filesystem::status(hostPath, ec);
+        if (ec || !std::filesystem::exists(status))
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        io_stat_t stat{};
+        stat.mode = std::filesystem::is_directory(status) ? kFioSoIfDir : kFioSoIfReg;
+        if (!std::filesystem::is_directory(status))
+        {
+            const uint64_t fileSize = std::filesystem::file_size(hostPath, ec);
+            if (ec)
+            {
+                setReturnS32(ctx, -1);
+                return;
+            }
+            stat.size = static_cast<uint32_t>(fileSize);
+            stat.hisize = static_cast<uint32_t>(fileSize >> 32u);
+        }
+
+        std::memcpy(ps2StatBuf, &stat, sizeof(stat));
+        setReturnS32(ctx, 0);
     }
 
     void fioRemove(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

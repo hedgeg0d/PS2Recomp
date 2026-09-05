@@ -27,9 +27,11 @@ namespace ps2x::iop
         bool configure(const GameIdentity &identity, std::string *error = nullptr);
         void reset();
 
+        [[nodiscard]] bool hasRpcService(uint32_t sid) const;
         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
         void onSifTransfer(const SifTransfer &transfer);
+        void onVBlank();
 
         [[nodiscard]] DebugSnapshot debugSnapshot() const;
 

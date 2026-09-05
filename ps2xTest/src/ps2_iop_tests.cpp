@@ -6,7 +6,10 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <limits>
+#include <map>
+#include <numeric>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -45,37 +48,73 @@ namespace
 
         bool readGuest(uint32_t address, void *destination, size_t size) const override
         {
-            if ((!destination && size != 0u) || !contains(address, size))
+            if ((!destination && size != 0u))
+            {
+                return false;
+            }
+            if (contains(address, size))
+            {
+                if (size != 0u)
+                {
+                    std::memcpy(destination, memory.data() + address, size);
+                }
+                return true;
+            }
+            const auto *block = findIopHeapRange(address, size);
+            if (!block)
             {
                 return false;
             }
             if (size != 0u)
             {
-                std::memcpy(destination, memory.data() + address, size);
+                std::memcpy(destination,
+                            block->data() + (address - iopHeapBlockBase(address)),
+                            size);
             }
             return true;
         }
 
         bool writeGuest(uint32_t address, const void *source, size_t size) override
         {
-            if ((!source && size != 0u) || !contains(address, size))
+            if ((!source && size != 0u))
+            {
+                return false;
+            }
+            if (contains(address, size))
+            {
+                if (size != 0u)
+                {
+                    std::memcpy(memory.data() + address, source, size);
+                }
+                return true;
+            }
+            auto *block = findIopHeapRange(address, size);
+            if (!block)
             {
                 return false;
             }
             if (size != 0u)
             {
-                std::memcpy(memory.data() + address, source, size);
+                std::memcpy(block->data() + (address - iopHeapBlockBase(address)), source, size);
             }
             return true;
         }
 
         bool zeroGuest(uint32_t address, size_t size) override
         {
-            if (!contains(address, size))
+            if (contains(address, size))
+            {
+                std::fill(memory.begin() + address, memory.begin() + address + size, 0u);
+                return true;
+            }
+            auto *block = findIopHeapRange(address, size);
+            if (!block)
             {
                 return false;
             }
-            std::fill(memory.begin() + address, memory.begin() + address + size, 0u);
+            std::fill(block->begin() + (address - iopHeapBlockBase(address)),
+                      block->begin() + (address - iopHeapBlockBase(address)) + size,
+                      0u);
             return true;
         }
 
@@ -90,6 +129,23 @@ namespace
             const uint32_t value = nextHandle;
             nextHandle += (kind == IopHandleKind::RpcPacket) ? 0x40u : 0x80u;
             return value;
+        }
+
+        uint32_t allocateIopHeap(uint32_t size) override
+        {
+            if (size == 0u)
+            {
+                return 0u;
+            }
+            const uint32_t address = (nextIopHeapAddress + 0xFu) & ~0xFu;
+            iopHeapContents.emplace(address, std::vector<uint8_t>(size, 0u));
+            nextIopHeapAddress = address + size;
+            return address;
+        }
+
+        bool freeIopHeap(uint32_t address) override
+        {
+            return iopHeapContents.erase(address) != 0u;
         }
 
         uint32_t allocateGuest(uint32_t size, uint32_t alignment) override
@@ -218,11 +274,62 @@ namespace
             }
         }
 
+        bool readCdSectors(uint32_t lbn,
+                           uint32_t sectors,
+                           void *destination,
+                           size_t size) override
+        {
+            if (!destination && size != 0u)
+            {
+                return false;
+            }
+            if (size != 0u)
+            {
+                auto *bytes = static_cast<uint8_t *>(destination);
+                if (!cdPattern)
+                {
+                    std::fill_n(bytes, size, uint8_t{0});
+                }
+                else
+                {
+                    const uint64_t base = static_cast<uint64_t>(lbn) * 2048u;
+                    for (size_t i = 0; i < size; ++i)
+                    {
+                        const uint64_t position = base + i;
+                        // Include high position bits so a full ring turn
+                        // cannot accidentally reproduce the same byte
+                        // pattern (the old linear byte pattern had a 256B
+                        // period).
+                        bytes[i] = static_cast<uint8_t>((position * 37u) ^
+                                                        (position >> 8u) ^
+                                                        (position >> 16u) ^ 0xA5u);
+                    }
+                }
+            }
+            return true;
+        }
+
         int32_t memoryCard(const MemoryCardRequest &request) override
         {
             lastMemoryCardRequest = request;
             ++memoryCardCalls;
             return 0;
+        }
+
+        bool readPadState(int port, int slot, uint8_t *data, size_t size) override
+        {
+            (void)port;
+            (void)slot;
+            if (!data || size < 32u)
+            {
+                return false;
+            }
+            std::memset(data, 0, 32);
+            data[1] = 0x41u;
+            data[2] = 0xFFu;
+            data[3] = 0xFFu;
+            data[4] = data[5] = data[6] = data[7] = 0x80u;
+            return true;
         }
 
         bool hasGuestFunction(uint32_t address) const override
@@ -292,15 +399,54 @@ namespace
         std::vector<uint32_t> lastGuestArguments;
         std::vector<std::pair<LogLevel, std::string>> logs;
         std::unordered_map<std::string, std::vector<uint8_t>> hostFileContents;
+        bool cdPattern = false;
         std::unordered_map<uint64_t, std::string> openHostFiles;
         std::vector<uint64_t> closedHostFileHandles;
         uint64_t nextHostFileHandle = 1u;
+        std::map<uint32_t, std::vector<uint8_t>> iopHeapContents;
+        uint32_t nextIopHeapAddress = 0x04000000u;
 
     private:
         bool contains(uint32_t address, size_t size) const
         {
             const uint64_t end = static_cast<uint64_t>(address) + static_cast<uint64_t>(size);
             return end <= memory.size();
+        }
+
+        static constexpr uint32_t iopHeapBase = 0x04000000u;
+
+        uint32_t iopHeapBlockBase(uint32_t address) const
+        {
+            auto it = iopHeapContents.upper_bound(address);
+            return it == iopHeapContents.begin() ? address : std::prev(it)->first;
+        }
+
+        const std::vector<uint8_t> *findIopHeapRange(uint32_t address, size_t size) const
+        {
+            auto it = iopHeapContents.upper_bound(address);
+            if (it == iopHeapContents.begin())
+            {
+                return nullptr;
+            }
+            --it;
+            const uint64_t offset = static_cast<uint64_t>(address) - it->first;
+            return offset <= it->second.size() && size <= it->second.size() - offset
+                       ? &it->second
+                       : nullptr;
+        }
+
+        std::vector<uint8_t> *findIopHeapRange(uint32_t address, size_t size)
+        {
+            auto it = iopHeapContents.upper_bound(address);
+            if (it == iopHeapContents.begin())
+            {
+                return nullptr;
+            }
+            --it;
+            const uint64_t offset = static_cast<uint64_t>(address) - it->first;
+            return offset <= it->second.size() && size <= it->second.size() - offset
+                       ? &it->second
+                       : nullptr;
         }
     };
 
@@ -371,6 +517,174 @@ void register_ps2_iop_tests()
             t.IsTrue(snapshot.activeProvider.empty(), "an unmatched game should not report a profile provider");
         });
 
+        tc.Run("core CDVD service resolves and reads a host-backed disc file", [](TestCase &t)
+        {
+            FakeIopHost host;
+            std::vector<uint8_t> file(2065u);
+            std::iota(file.begin(), file.end(), uint8_t{0u});
+            host.hostFileContents["fake/cd/MOVIE.BIN"] = file;
+
+            ps2x::iop::IopSubsystem subsystem(host);
+            std::string error;
+            t.IsTrue(subsystem.configure({"unmatched.elf", 0u, 0u}, &error),
+                     "core CDVD service should be available without a game profile");
+
+            constexpr uint32_t kSearchSend = 0x1000u;
+            constexpr uint32_t kSearchResult = 0x2000u;
+            constexpr uint32_t kSearchReceive = 0x3000u;
+            constexpr uint32_t kReadSend = 0x4000u;
+            constexpr uint32_t kReadDestination = 0x5000u;
+            constexpr uint32_t kReadPosition = 0x6000u;
+            constexpr uint32_t kCdvdSearchFileSid = 0x80000597u;
+            constexpr uint32_t kCdvdNcmdSid = 0x80000595u;
+
+            const char path[] = "cdrom0:\\MOVIE.BIN;1";
+            t.IsTrue(host.writeGuest(kSearchSend + 32u, path, sizeof(path)),
+                     "CDVD search path should be writable in the guest buffer");
+            t.IsTrue(host.writeWord(kSearchSend + 288u, kSearchResult),
+                     "CDVD search result pointer should be writable in the guest buffer");
+
+            ps2x::iop::RpcRequest search{};
+            search.sid = kCdvdSearchFileSid;
+            search.send = {kSearchSend, 292u + sizeof(uint32_t)};
+            search.receive = {kSearchReceive, sizeof(uint32_t)};
+            t.IsTrue(subsystem.handleRpc(search).handled,
+                     "core CDVD service should handle SEARCHFILE");
+            t.Equals(host.readWord(kSearchReceive), 1u,
+                     "SEARCHFILE should report a host-backed file");
+            t.Equals(host.readWord(kSearchResult), 0x00100000u,
+                     "SEARCHFILE should return a stable virtual LBN");
+            t.Equals(host.readWord(kSearchResult + 4u), 2065u,
+                     "SEARCHFILE should return the host file size");
+
+            t.IsTrue(host.writeWord(kReadSend + 0u, 0x00100000u),
+                     "read LBN should be writable");
+            t.IsTrue(host.writeWord(kReadSend + 4u, 2u),
+                     "read sector count should be writable");
+            t.IsTrue(host.writeWord(kReadSend + 8u, kReadDestination),
+                     "read destination should be writable");
+            t.IsTrue(host.writeWord(kReadSend + 12u, 0u),
+                     "read mode should be writable");
+            t.IsTrue(host.writeWord(kReadSend + 20u, kReadPosition),
+                     "read position pointer should be writable");
+
+            ps2x::iop::RpcRequest read{};
+            read.sid = kCdvdNcmdSid;
+            read.function = 1u;
+            read.send = {kReadSend, 24u};
+            t.IsTrue(subsystem.handleRpc(read).handled,
+                     "core CDVD service should handle a sector read");
+
+            std::vector<uint8_t> actual(4096u);
+            t.IsTrue(host.readGuest(kReadDestination, actual.data(), actual.size()),
+                     "CDVD read output should be readable from guest memory");
+            t.IsTrue(std::equal(file.begin(), file.end(), actual.begin()),
+                     "CDVD read should preserve the host file payload");
+            t.IsTrue(std::all_of(actual.begin() + file.size(), actual.end(), [](uint8_t value)
+                                 { return value == 0u; }),
+                     "CDVD read should zero-fill the unused part of the final sector");
+            t.Equals(host.readWord(kReadPosition), 0x00100002u,
+                     "CDVD read should advance the reported position");
+        });
+
+        tc.Run("core LOADFILE service uses the host path bridge", [](TestCase &t)
+        {
+            FakeIopHost host;
+            host.hostFileContents["translated/cdrom0:/MODULE.IRX"] = {0x7Fu};
+
+            ps2x::iop::IopSubsystem subsystem(host);
+            std::string error;
+            t.IsTrue(subsystem.configure({"unmatched.elf", 0u, 0u}, &error),
+                     "core LOADFILE service should be available without a game profile");
+
+            constexpr uint32_t kSendAddress = 0x7000u;
+            constexpr uint32_t kReceiveAddress = 0x7100u;
+            constexpr uint32_t kLoadFileSid = 0x80000006u;
+            constexpr char kModulePath[] = "cdrom0:/MODULE.IRX";
+            t.IsTrue(host.writeGuest(kSendAddress + 8u,
+                                     kModulePath,
+                                     sizeof(kModulePath)),
+                     "LOADFILE path should be writable in the guest packet");
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = kLoadFileSid;
+            request.function = 0u;
+            request.send = {kSendAddress, 8u + sizeof(kModulePath)};
+            request.receive = {kReceiveAddress, 8u};
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "core LOADFILE service should handle module load");
+            t.IsTrue(static_cast<int32_t>(host.readWord(kReceiveAddress)) > 0,
+                     "LOADFILE should return a positive module identifier for an existing file");
+            t.Equals(host.readWord(kReceiveAddress + 4u), 0u,
+                     "LOADFILE should clear the module result status");
+        });
+
+        tc.Run("core IOPHEAP service allocates, loads, and frees IOP memory", [](TestCase &t)
+        {
+            FakeIopHost host;
+            const std::vector<uint8_t> module = {0x10u, 0x20u, 0x30u, 0x40u, 0x50u};
+            host.hostFileContents["translated/cdrom0:/MODULE.IRX"] = module;
+
+            ps2x::iop::IopSubsystem subsystem(host);
+            std::string error;
+            t.IsTrue(subsystem.configure({"unmatched.elf", 0u, 0u}, &error),
+                     "core IOPHEAP service should be available without a game profile");
+
+            constexpr uint32_t kSid = 0x80000003u;
+            constexpr uint32_t kAllocateSend = 0x8000u;
+            constexpr uint32_t kAllocateReceive = 0x8100u;
+            constexpr uint32_t kLoadSend = 0x8200u;
+            constexpr uint32_t kLoadReceive = 0x8300u;
+            constexpr uint32_t kFreeSend = 0x8400u;
+            constexpr uint32_t kFreeReceive = 0x8500u;
+            constexpr uint32_t kAllocationSize = 0x100u;
+            constexpr char kPath[] = "cdrom0:/MODULE.IRX";
+
+            t.IsTrue(host.writeWord(kAllocateSend, kAllocationSize),
+                     "IOPHEAP allocation size should be writable");
+            ps2x::iop::RpcRequest allocate{};
+            allocate.sid = kSid;
+            allocate.function = 1u;
+            allocate.send = {kAllocateSend, sizeof(uint32_t)};
+            allocate.receive = {kAllocateReceive, sizeof(uint32_t)};
+            t.IsTrue(subsystem.handleRpc(allocate).handled,
+                     "IOPHEAP allocation should be handled");
+            const uint32_t address = host.readWord(kAllocateReceive);
+            t.IsTrue(address != 0u, "IOPHEAP allocation should return an address");
+
+            t.IsTrue(host.writeWord(kLoadSend, address),
+                     "IOPHEAP load destination should be writable");
+            t.IsTrue(host.writeGuest(kLoadSend + 4u, kPath, sizeof(kPath)),
+                     "IOPHEAP load path should be writable");
+            ps2x::iop::RpcRequest load{};
+            load.sid = kSid;
+            load.function = 3u;
+            load.send = {kLoadSend, 4u + sizeof(kPath)};
+            load.receive = {kLoadReceive, sizeof(uint32_t)};
+            t.IsTrue(subsystem.handleRpc(load).handled,
+                     "IOPHEAP load should be handled");
+            t.Equals(host.readWord(kLoadReceive), 0u,
+                     "IOPHEAP load should return success");
+            std::vector<uint8_t> loaded(module.size());
+            t.IsTrue(host.readGuest(address, loaded.data(), loaded.size()),
+                     "loaded IOPHEAP bytes should be readable");
+            t.Equals(loaded, module, "IOPHEAP load should copy the host file into IOP memory");
+
+            t.IsTrue(host.writeWord(kFreeSend, address),
+                     "IOPHEAP free address should be writable");
+            ps2x::iop::RpcRequest free{};
+            free.sid = kSid;
+            free.function = 2u;
+            free.send = {kFreeSend, sizeof(uint32_t)};
+            free.receive = {kFreeReceive, sizeof(uint32_t)};
+            t.IsTrue(subsystem.handleRpc(free).handled,
+                     "IOPHEAP free should be handled");
+            t.Equals(host.readWord(kFreeReceive), 0u,
+                     "IOPHEAP free should return success");
+            t.IsFalse(host.readGuest(address, loaded.data(), loaded.size()),
+                      "freed IOPHEAP bytes should no longer be accessible");
+        });
+
         tc.Run("built-in profiles select by ELF basename and keep core services active", [](TestCase &t)
         {
             FakeIopHost host;
@@ -403,6 +717,174 @@ void register_ps2_iop_tests()
                      "reload should destroy services from the previous profile");
             t.IsNotNull(findService(snapshot, "SDRDRV"),
                         "Fatal Frame profile should expose SDRDRV");
+        });
+
+        tc.Run("PS2LIB sound forwards commands to the host audio endpoint", [](TestCase &t)
+        {
+            FakeIopHost host;
+            ps2x::iop::IopSubsystem subsystem(host);
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = 0x00010001u;
+            request.function = 0x1u;
+            request.send = {0x1200u, 16u};
+            request.receive = {0x1300u, 16u};
+
+            const ps2x::iop::RpcResult result = subsystem.handleRpc(request);
+            t.IsTrue(result.handled, "PS2LIB sound should handle its public SID");
+            t.Equals(host.audioCalls, 1u, "PS2LIB sound should forward one host audio command");
+            t.Equals(host.lastAudioSid, request.sid, "forwarded audio command should retain the SID");
+            t.Equals(host.lastAudioFunction, request.function,
+                     "forwarded audio command should retain the function number");
+            t.Equals(host.lastAudioSend.address, request.send.address,
+                     "forwarded audio command should retain the send buffer");
+            t.Equals(host.lastAudioReceive.address, request.receive.address,
+                      "forwarded audio command should retain the receive buffer");
+        });
+
+        tc.Run("PS2LIB Filectrl init publishes its ready report", [](TestCase &t)
+        {
+            FakeIopHost host;
+            ps2x::iop::IopSubsystem subsystem(host);
+
+            constexpr uint32_t kSendAddress = 0x1200u;
+            constexpr uint32_t kControlAddress = 0x1400u;
+            std::array<uint8_t, 0x41u> control;
+            control.fill(0xAAu);
+            t.IsTrue(host.writeGuest(kControlAddress, control.data(), control.size()),
+                     "Filectrl control block should be writable");
+            t.IsTrue(host.writeWord(kSendAddress, kControlAddress),
+                     "Filectrl init argument should be writable");
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = 0x00010000u;
+            request.function = 0u;
+            request.send = {kSendAddress, 0x10u};
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "PS2LIB Filectrl should handle init");
+
+            t.Equals(host.memory[kControlAddress + 0x14u], uint8_t{1u},
+                     "Filectrl init report should mark synchronization complete");
+            t.Equals(host.memory[kControlAddress + 0x40u], uint8_t{0xAAu},
+                     "Filectrl report transfer should copy exactly 0x40 bytes");
+        });
+
+        tc.Run("PS2LIB Filectrl preserves byte continuity across ring refills", [](TestCase &t)
+        {
+            // Exercise more than one complete ring turnover.  A single
+            // refill catches the first partial-sector boundary; two turns
+            // additionally verify that the byte cursor survives repeated
+            // producer/consumer wrap-around.
+            FakeIopHost host(0x100000u);
+            host.cdPattern = true;
+            ps2x::iop::IopSubsystem subsystem(host);
+
+            constexpr uint32_t kSendAddress = 0x1200u;
+            constexpr uint32_t kControlAddress = 0x1400u;
+            constexpr uint32_t kResultAddress = 0x1800u;
+            constexpr uint32_t kDestination = 0x2000u;
+            constexpr uint32_t kStartLbn = 3u;
+            constexpr uint32_t kPayloadSize = 0x62000u;
+
+            t.IsTrue(host.writeWord(kSendAddress, kControlAddress),
+                     "Filectrl init packet should be writable");
+            ps2x::iop::RpcRequest init{};
+            init.sid = 0x00010000u;
+            init.function = 0u;
+            init.send = {kSendAddress, 0x10u};
+            t.IsTrue(subsystem.handleRpc(init).handled,
+                     "Filectrl init should handle the service packet");
+
+            t.IsTrue(host.writeWord(kSendAddress + 0u, kStartLbn),
+                     "read LBN should be writable");
+            t.IsTrue(host.writeWord(kSendAddress + 4u, kPayloadSize),
+                     "read size should be writable");
+            t.IsTrue(host.writeWord(kSendAddress + 8u, 1u << 3u),
+                     "buffering flag should be writable");
+            t.IsTrue(host.writeWord(kSendAddress + 12u, 0u),
+                     "read mode should be writable");
+
+            ps2x::iop::RpcRequest start{};
+            start.sid = 0x00010000u;
+            start.function = 3u;
+            start.send = {kSendAddress, 0x10u};
+            t.IsTrue(subsystem.handleRpc(start).handled,
+                     "Filectrl read should handle the service packet");
+
+            ps2x::iop::RpcRequest transfer{};
+            transfer.sid = 0x00010000u;
+            transfer.function = 4u;
+            transfer.send = {kSendAddress, 0x10u};
+            transfer.receive = {kResultAddress, 4u};
+            t.IsTrue(host.writeWord(kSendAddress + 0u, kDestination),
+                     "first transfer destination should be writable");
+            t.IsTrue(host.writeWord(kSendAddress + 4u, 0x20000u),
+                     "first transfer size should be writable");
+            t.IsTrue(subsystem.handleRpc(transfer).handled,
+                     "first Filectrl transfer should be handled");
+
+            const uint64_t firstSource = static_cast<uint64_t>(kStartLbn) * 2048u + 16u;
+            t.Equals(host.memory[kDestination],
+                     static_cast<uint8_t>((firstSource * 37u) ^ (firstSource >> 8u) ^
+                                          (firstSource >> 16u) ^ 0xA5u),
+                     "buffered payload should begin after its protocol header");
+
+            t.IsTrue(host.writeWord(kSendAddress + 0u, kDestination + 0x20000u),
+                     "second transfer destination should be writable");
+            t.IsTrue(host.writeWord(kSendAddress + 4u, 0x20000u),
+                     "second transfer size should be writable");
+            t.IsTrue(subsystem.handleRpc(transfer).handled,
+                     "second Filectrl transfer should be handled");
+
+            const uint64_t secondSource = firstSource + 0x20000u;
+            t.Equals(host.memory[kDestination + 0x20000u],
+                     static_cast<uint8_t>((secondSource * 37u) ^ (secondSource >> 8u) ^
+                                          (secondSource >> 16u) ^ 0xA5u),
+                     "ring refill should continue at the next byte, not next sector");
+
+            t.IsTrue(host.writeWord(kSendAddress + 0u, kDestination + 0x40000u),
+                     "third transfer destination should be writable");
+            t.IsTrue(host.writeWord(kSendAddress + 4u, 0x20000u),
+                     "third transfer size should be writable");
+            t.IsTrue(subsystem.handleRpc(transfer).handled,
+                     "third Filectrl transfer should be handled");
+
+            t.IsTrue(host.writeWord(kSendAddress + 0u, kDestination + 0x60000u),
+                     "final transfer destination should be writable");
+            t.IsTrue(host.writeWord(kSendAddress + 4u, 0x2000u),
+                     "final transfer size should be writable");
+            t.IsTrue(subsystem.handleRpc(transfer).handled,
+                     "final Filectrl transfer should be handled");
+
+            // Filectrl exposes the requested logical payload only.  The CD
+            // backend may round its physical sector reads, but padding must
+            // not leak into the guest-visible buffered-byte count.
+            ps2x::iop::RpcRequest status{};
+            status.sid = 0x00010000u;
+            status.function = 6u;
+            status.send = {kSendAddress, 0x10u};
+            status.receive = {kResultAddress, 0x40u};
+            t.IsTrue(subsystem.handleRpc(status).handled,
+                     "Filectrl status should expose the drained logical payload");
+            uint32_t roundedTail = 0u;
+            std::memcpy(&roundedTail, host.memory.data() + kControlAddress + 0x10u,
+                        sizeof(roundedTail));
+            t.Equals(roundedTail, 0u,
+                     "buffered read should not retain sector padding after payload");
+
+            // Validate the complete stream, not just the first byte of each
+            // transfer.  This makes the test sensitive to both sector and
+            // ring-wrap discontinuities.
+            for (uint32_t offset = 0u; offset < kPayloadSize; ++offset)
+            {
+                const uint64_t source = firstSource + offset;
+                const uint8_t expected = static_cast<uint8_t>((source * 37u) ^
+                                                               (source >> 8u) ^
+                                                               (source >> 16u) ^ 0xA5u);
+                t.Equals(host.memory[kDestination + offset],
+                         expected,
+                         "multi-turn Filectrl stream should preserve every byte");
+            }
         });
 
         tc.Run("two subsystem instances isolate profile state and reset deterministically", [](TestCase &t)
@@ -867,8 +1349,8 @@ void register_ps2_iop_tests()
                      "the most specific plugin profile should be selected");
 
             error.clear();
-            t.IsTrue(subsystem.configure({"different.elf", kSyntheticEntryPoint, kSyntheticCrc32}, &error),
-                     "switching to an unmatched ELF should destroy the active plugin profile");
+            t.IsFalse(subsystem.configure({"different.elf", kSyntheticEntryPoint, kSyntheticCrc32}, &error),
+                      "switching to an unmatched ELF should destroy the active plugin profile");
             t.IsTrue(host.hasLog("fake-plugin-destroy"),
                      "plugin profile destroy callback should run when the active profile is replaced");
             t.IsTrue(subsystem.debugSnapshot().activeProfile.empty(),

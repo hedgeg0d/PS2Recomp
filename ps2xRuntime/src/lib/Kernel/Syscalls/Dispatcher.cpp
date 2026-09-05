@@ -253,6 +253,9 @@ namespace ps2_syscalls
         case 0x64:
             FlushCache(rdram, ctx, runtime);
             return true;
+        case 0x6B:
+            ps2_stubs::sceSifStopDma(rdram, ctx, runtime);
+            return true;
         case 0x6E:
             SetOsdConfigParam2(rdram, ctx, runtime);
             return true;
@@ -288,6 +291,12 @@ namespace ps2_syscalls
         case 0x78:
         case static_cast<uint32_t>(-0x78):
             ps2_stubs::sceSifSetDChain(rdram, ctx, runtime);
+            return true;
+        case 0x79:
+            ps2_stubs::sceSifSetReg(rdram, ctx, runtime);
+            return true;
+        case 0x7A:
+            ps2_stubs::sceSifGetReg(rdram, ctx, runtime);
             return true;
         case 0x7F:
             GetMemorySize(rdram, ctx, runtime);
