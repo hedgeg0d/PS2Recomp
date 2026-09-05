@@ -2,6 +2,8 @@
 #include "Thread.h"
 #include "runtime/ee_scheduler.h"
 
+#include <iostream>
+
 namespace ps2_syscalls
 {
     namespace
@@ -134,6 +136,17 @@ namespace ps2_syscalls
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
             const int result = ee.wakeupThread(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+            if (getRegU32(ctx, 4) == 3u || getRegU32(ctx, 4) == 4u)
+            {
+                static uint32_t wakeCallProbeCount = 0u;
+                if (wakeCallProbeCount++ < 64u)
+                {
+                    std::cerr << "[probe:wakeup-call] target=" << getRegU32(ctx, 4) << " pc=0x" << std::hex
+                              << (ctx ? ctx->pc : 0u)
+                              << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u)
+                              << " result=" << std::dec << result << '\n';
+                }
+            }
             setReturnS32(ctx, result);
             ee.transferIfRequested(interruptSafe);
         }
@@ -230,7 +243,20 @@ namespace ps2_syscalls
             param->initial_priority,
             param->option,
         };
-        setReturnS32(ctx, scheduler(rdram, ctx, runtime).createThread(decoded));
+        const int result = scheduler(rdram, ctx, runtime).createThread(decoded);
+        static uint32_t traceCount = 0u;
+        if (traceCount < 64u)
+        {
+            std::cerr << "[probe:ee-thread-create] id=" << result
+                      << " entry=0x" << std::hex << decoded.entry
+                      << " stack=0x" << decoded.stack
+                      << " size=0x" << decoded.stackSize
+                      << " gp=0x" << decoded.gp
+                      << " prio=" << std::dec << decoded.priority
+                      << " caller=0x" << std::hex << getRegU32(ctx, 31) << std::dec << std::endl;
+            ++traceCount;
+        }
+        setReturnS32(ctx, result);
     }
 
     void DeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -282,6 +308,15 @@ namespace ps2_syscalls
             target->ownsStack = true;
         }
         const int result = ee.startThread(id, arg, *ctx, false);
+        static uint32_t traceCount = 0u;
+        if (traceCount < 64u)
+        {
+            std::cerr << "[probe:ee-thread-start] id=" << id
+                      << " result=" << result << " arg=0x" << std::hex << arg
+                      << " entry=0x" << (target ? target->entry : 0u)
+                      << std::dec << std::endl;
+            ++traceCount;
+        }
         setReturnS32(ctx, result);
         ee.transferIfRequested(false);
     }

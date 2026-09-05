@@ -285,6 +285,31 @@ void register_code_generator_tests()
                  "constant RDRAM SW should not go through WRITE32 address classification");
     });
 
+    tc.Run("unsigned loads emit zero-extending GPR writes", [](TestCase &t) {
+        Function func;
+        func.name = "unsigned_loads";
+        func.start = 0x2400;
+        func.end = 0x2410;
+        func.isRecompiled = true;
+
+        std::vector<Instruction> instructions{
+            makeIType(0x2400, OPCODE_LBU, 1, 2, 0),
+            makeIType(0x2404, OPCODE_LHU, 1, 3, 2),
+            makeIType(0x2408, OPCODE_LWU, 1, 4, 4),
+        };
+
+        CodeGenerator gen({}, {});
+        const std::string generated = gen.generateFunction(func, instructions, false);
+        printGeneratedCode("unsigned loads emit zero-extending GPR writes", generated);
+
+        t.IsTrue(generated.find("SET_GPR_ZE32(ctx, 2, (uint8_t)") != std::string::npos,
+                 "LBU should zero-extend its loaded byte");
+        t.IsTrue(generated.find("SET_GPR_ZE32(ctx, 3, (uint16_t)") != std::string::npos,
+                 "LHU should zero-extend its loaded halfword");
+        t.IsTrue(generated.find("SET_GPR_ZE32(ctx, 4,") != std::string::npos,
+                 "LWU should zero-extend its loaded word");
+    });
+
     tc.Run("known GIF DMA MMIO sequence emits native kick helper", [](TestCase &t) {
         Function func;
         func.name = "gif_dma_kick";
@@ -713,6 +738,35 @@ void register_code_generator_tests()
 
         t.IsTrue(generated.find("ctx->pc = 0x") != std::string::npos, "external branch should set ctx->pc");
         t.IsTrue(generated.find("goto label_") == std::string::npos, "external branch should not use goto");
+    });
+
+    tc.Run("signed conditional branches use full R5900 GPR width", [](TestCase &t) {
+        Function func;
+        func.name = "wide_signed_branch";
+        func.start = 0x7000;
+        func.end = 0x7010;
+        func.isRecompiled = true;
+        func.isStub = false;
+
+        Instruction branch{};
+        branch.address = 0x7000;
+        branch.opcode = OPCODE_BLEZ;
+        branch.rs = 4;
+        branch.rt = 0;
+        branch.simmediate = 1;
+        branch.isBranch = true;
+        branch.hasDelaySlot = true;
+        branch.raw = (OPCODE_BLEZ << 26) | (4u << 21) | 1u;
+
+        std::vector<Instruction> instructions{branch, makeNop(0x7004), makeNop(0x7008)};
+        CodeGenerator gen({}, {});
+        const std::string generated = gen.generateFunction(func, instructions, false);
+        printGeneratedCode("signed conditional branches use full R5900 GPR width", generated);
+
+        t.IsTrue(generated.find("GPR_S64(ctx, 4) <= 0") != std::string::npos,
+                 "BLEZ should compare the full signed 64-bit GPR");
+        t.IsFalse(generated.find("GPR_S32(ctx, 4) <= 0") != std::string::npos,
+                  "BLEZ must not truncate the signed comparison to 32 bits");
     });
 
     tc.Run("jumps to known symbols call by name", [](TestCase &t) {

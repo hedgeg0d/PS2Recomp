@@ -49,6 +49,8 @@ public:
     bool zeroGuest(uint32_t address, size_t size) override;
     bool normalizeGuestAddress(uint32_t address, uint32_t &normalized) const override;
     uint32_t allocateIopHandle(ps2x::iop::IopHandleKind kind) override;
+    uint32_t allocateIopHeap(uint32_t size) override;
+    bool freeIopHeap(uint32_t address) override;
     uint32_t allocateGuest(uint32_t size, uint32_t alignment) override;
     void freeGuest(uint32_t address) override;
 
@@ -67,8 +69,14 @@ public:
                       size_t size,
                       size_t &bytesRead) override;
     void closeHostFile(uint64_t handle) override;
+    bool readCdSectors(uint32_t lbn,
+                       uint32_t sectors,
+                       void *destination,
+                       size_t size) override;
 
     int32_t memoryCard(const ps2x::iop::MemoryCardRequest &request) override;
+
+    bool readPadState(int port, int slot, uint8_t *data, size_t size) override;
 
     bool hasGuestFunction(uint32_t address) const override;
     bool invokeGuestFunction(uint64_t callToken,

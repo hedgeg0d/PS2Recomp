@@ -1,6 +1,9 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include "ps2_log.h"
+#include <atomic>
 #include <cstring>
+#include <iostream>
 
 enum VIFCmd : uint8_t
 {
@@ -264,6 +267,28 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
     if (sizeBytes == 0u)
         return;
 
+    static std::atomic<uint32_t> scanProbes{0u};
+    if (scanProbes.fetch_add(1u, std::memory_order_relaxed) < 16u)
+    {
+        uint32_t mscalCandidates = 0u;
+        uint32_t printed = 0u;
+        for (uint32_t i = 0u; i + 4u <= sizeBytes; i += 4u)
+        {
+            uint32_t raw = 0u;
+            std::memcpy(&raw, data + i, sizeof(raw));
+            const uint8_t op = static_cast<uint8_t>((raw >> 24u) & 0x7Fu);
+            if (op == VIF_MSCAL || op == VIF_MSCALF || op == VIF_MSCNT)
+            {
+                ++mscalCandidates;
+                if (printed++ < 8u)
+                    std::cerr << "[probe:vif1-scan-hit] off=0x" << std::hex << i
+                              << " raw=0x" << raw << std::dec << '\n';
+            }
+        }
+        std::cerr << "[probe:vif1-scan] bytes=0x" << std::hex << sizeBytes
+                  << " mscalCandidates=0x" << mscalCandidates << std::dec << '\n';
+    }
+
     uint32_t pos = 0;
 
     while (pos + 4 <= sizeBytes)
@@ -287,7 +312,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             submitGifPacket(GifPathId::Path2,
                             imagePacket.data(),
                             static_cast<uint32_t>(imagePacket.size()),
-                            true,
+                            false,
                             m_vif1PendingPath2DirectHl);
 
             pos += chunkQw * 16u;
@@ -307,6 +332,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         uint16_t imm = cmd & 0xFFFF;
         uint8_t num = (cmd >> 16) & 0xFF;
         const bool irq = (cmd & 0x80000000u) != 0u;
+
+        static std::atomic<uint32_t> vif1Commands{0u};
+        const uint32_t commandProbe = vif1Commands.fetch_add(1u, std::memory_order_relaxed);
+        if (commandProbe < 96u)
+        {
+            std::cerr << "[probe:vif1-cmd] op=0x" << std::hex
+                      << static_cast<unsigned>(opcode)
+                      << " num=0x" << static_cast<unsigned>(num)
+                      << " imm=0x" << imm << " bytes-left=0x"
+                      << (sizeBytes - pos) << std::dec << '\n';
+        }
 
         // Track most-recent command for VIFn_CODE emulation.
         vif1_regs.code = cmd;
@@ -371,6 +407,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
             uint32_t startPC = (uint32_t)imm * 8u;
+
+            static std::atomic<uint32_t> mscalProbes{0u};
+            const uint32_t mscalProbe = mscalProbes.fetch_add(1u, std::memory_order_relaxed);
+            if (mscalProbe < 64u)
+                std::cerr << "[probe:vif1-mscal] op=0x" << std::hex
+                          << static_cast<unsigned>(opcode) << " start=0x" << startPC
+                          << " top=0x" << vif1_regs.tops << " itop=0x" << vif1_regs.itops
+                          << std::dec << '\n';
 
             // Values visible to the VU program for this MSCAL.
             // DobieStation semantics: ITOP = ITOPS; TOP = current TOPS;
@@ -471,7 +515,20 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
+                static std::atomic<uint32_t> directProbes{0u};
+                const uint32_t directProbe = directProbes.fetch_add(1u, std::memory_order_relaxed);
+                if (directProbe < 64u)
+                {
+                    uint64_t gifTag = 0u;
+                    std::memcpy(&gifTag, data + pos, sizeof(gifTag));
+                    std::cerr << "[probe:vif1-direct] qwc=0x" << std::hex << qwCount
+                              << " tag=0x" << gifTag << " directhl=" << (directHl ? 1 : 0)
+                              << std::dec << '\n';
+                }
+                // Queue all DIRECT packets from one VIF transfer and drain once
+                // at the end. Draining every packet individually turns large
+                // video VIF chains into an O(n²) sort/flush loop.
+                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, false, directHl);
 
                 const uint32_t imageQw = gifImageQwcFromTag(data + pos, qwCount * 16u);
                 if (imageQw != 0u)
@@ -757,4 +814,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             continue;
         }
     }
+
+    if (m_gifArbiter)
+        m_gifArbiter->drain();
 }

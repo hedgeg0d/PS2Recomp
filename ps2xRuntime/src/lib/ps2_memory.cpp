@@ -672,6 +672,13 @@ uint8_t PS2Memory::read8(uint32_t address)
     {
         return m_scratchpad[physAddr];
     }
+    if (isIoRegister(physAddr))
+    {
+        uint32_t regAddr = physAddr & ~0x3;
+        uint32_t value = readIORegister(regAddr);
+        uint32_t shift = (physAddr & 3) * 8;
+        return static_cast<uint8_t>((value >> shift) & 0xFF);
+    }
     if (physAddr < PS2_RAM_SIZE)
     {
         return m_rdram[physAddr];
@@ -682,13 +689,6 @@ uint8_t PS2Memory::read8(uint32_t address)
     {
         (void)vuLimit;
         return vuMem[vuOffset];
-    }
-    else if (isIoRegister(physAddr))
-    {
-        uint32_t regAddr = physAddr & ~0x3;
-        uint32_t value = readIORegister(regAddr);
-        uint32_t shift = (physAddr & 3) * 8;
-        return static_cast<uint8_t>((value >> shift) & 0xFF);
     }
 
     return 0;
@@ -708,6 +708,13 @@ uint16_t PS2Memory::read16(uint32_t address)
     {
         return loadScalar<uint16_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, "read16 scratchpad", address);
     }
+    if (isIoRegister(physAddr))
+    {
+        uint32_t regAddr = physAddr & ~0x3;
+        uint32_t value = readIORegister(regAddr);
+        uint32_t shift = (physAddr & 2) * 8;
+        return static_cast<uint16_t>((value >> shift) & 0xFFFF);
+    }
     if (physAddr < PS2_RAM_SIZE)
     {
         return loadScalar<uint16_t>(m_rdram, physAddr, PS2_RAM_SIZE, "read16 rdram", address);
@@ -717,13 +724,6 @@ uint16_t PS2Memory::read16(uint32_t address)
     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit))
     {
         return loadScalar<uint16_t>(vuMem, vuOffset, vuLimit, "read16 vu", address);
-    }
-    else if (isIoRegister(physAddr))
-    {
-        uint32_t regAddr = physAddr & ~0x3;
-        uint32_t value = readIORegister(regAddr);
-        uint32_t shift = (physAddr & 2) * 8;
-        return static_cast<uint16_t>((value >> shift) & 0xFFFF);
     }
 
     return 0;
@@ -759,6 +759,10 @@ uint32_t PS2Memory::read32(uint32_t address)
     {
         return loadScalar<uint32_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, "read32 scratchpad", address);
     }
+    if (isIoRegister(physAddr))
+    {
+        return readIORegister(physAddr);
+    }
     if (physAddr < PS2_RAM_SIZE)
     {
         return loadScalar<uint32_t>(m_rdram, physAddr, PS2_RAM_SIZE, "read32 rdram", address);
@@ -768,10 +772,6 @@ uint32_t PS2Memory::read32(uint32_t address)
     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
     {
         return loadScalar<uint32_t>(vuMem, vuOffset, vuLimit, "read32 vu", address);
-    }
-    else if (isIoRegister(physAddr))
-    {
-        return readIORegister(physAddr);
     }
 
     return 0;
@@ -802,6 +802,22 @@ uint64_t PS2Memory::read64(uint32_t address)
     {
         return loadScalar<uint64_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, "read64 scratchpad", address);
     }
+    // 64-bit IO read: compose from the two adjacent 32-bit IO register slots
+    // to avoid any side-effects from read32 handlers.
+    if (isIoRegister(physAddr))
+    {
+        size_t timerIndex = 0u;
+        uint32_t timerOffset = 0u;
+        if (decodeEeTimerRegister(physAddr, timerIndex, timerOffset))
+        {
+            uint32_t lo = readIORegister(physAddr);
+            uint32_t hi = readIORegister(physAddr + 4);
+            return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+        }
+        uint32_t lo = m_ioRegisters.count(physAddr) ? m_ioRegisters[physAddr] : 0u;
+        uint32_t hi = m_ioRegisters.count(physAddr + 4) ? m_ioRegisters[physAddr + 4] : 0u;
+        return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+    }
     if (physAddr < PS2_RAM_SIZE)
     {
         return loadScalar<uint64_t>(m_rdram, physAddr, PS2_RAM_SIZE, "read64 rdram", address);
@@ -813,15 +829,8 @@ uint64_t PS2Memory::read64(uint32_t address)
         return loadScalar<uint64_t>(vuMem, vuOffset, vuLimit, "read64 vu", address);
     }
 
-    // 64-bit IO read: compose from the two adjacent 32-bit IO register slots
-    // to avoid any side-effects from read32 handlers.
-    if (isIoRegister(address))
-    {
-        uint32_t lo = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
-        uint32_t hi = m_ioRegisters.count(address + 4) ? m_ioRegisters[address + 4] : 0u;
-        return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
-    }
-    return (uint64_t)read32(address) | ((uint64_t)read32(address + 4) << 32);
+    return static_cast<uint64_t>(read32(address)) |
+           (static_cast<uint64_t>(read32(address + 4u)) << 32u);
 }
 
 __m128i PS2Memory::read128(uint32_t address)
@@ -1160,6 +1169,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     if (address >= 0x10002000 && address <= 0x10002030)
     {
+        // Bounded diagnostics for the IPU command/status path.  This remains
+        // middleware-level instrumentation (no guest address knowledge) and
+        // is intentionally capped so long-running decoders do not flood logs.
+        static std::atomic<uint32_t> ipuWrites{0u};
+        const uint32_t n = ipuWrites.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 128u)
+        {
+            std::cerr << "[probe:ipu-write] addr=0x" << std::hex << address
+                      << " value=0x" << value << std::dec << '\n';
+        }
         if (address == 0x10002010)
         {
             m_ioRegisters[address] = value & ~(1u << 31);
@@ -1279,7 +1298,18 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t channelBase = address & 0xFFFFFF00;
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
+            const uint32_t tadr = m_ioRegisters[channelBase + 0x30];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+
+            static std::atomic<uint32_t> dmaStarts{0u};
+            const uint32_t dmaProbe = dmaStarts.fetch_add(1u, std::memory_order_relaxed);
+            if (dmaProbe < 128u)
+            {
+                std::cerr << "[probe:dma-start] ch=0x" << std::hex << channelBase
+                          << " madr=0x" << madr << " qwc=0x" << qwc
+                          << " tadr=0x" << tadr
+                          << " chcr=0x" << value << std::dec << '\n';
+            }
 
             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) &&
                 (m_gsVRAM || channelBase == 0x10008000u))
@@ -1353,7 +1383,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         }
                     };
 
-                    auto appendCompactVif1TagData = [&](uint32_t localTagAddr, uint32_t qwCount)
+                    auto appendVifTagUpper = [&](uint32_t localTagAddr)
                     {
                         uint32_t tagPhys = 0u;
                         const bool tagScratch = isScratchpad(localTagAddr);
@@ -1366,7 +1396,6 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                         // VIF packet helpers embed 8 bytes of VIF stream in the DMAtag's upper half.
                         chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
-                        appendData(localTagAddr + 16u, qwCount);
                     };
 
                     int tagsProcessed = 0;
@@ -1408,6 +1437,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                         ++tagsProcessed;
+
+                        if (channelBase == 0x10009000u && tagsProcessed <= 12)
+                        {
+                            std::cerr << "[probe:vif1-tag] n=" << tagsProcessed
+                                      << " addr=0x" << std::hex << currentTagAddr
+                                      << " id=" << id << " qwc=0x" << tagQwc
+                                      << " upper=0x" << (tag >> 32) << std::dec << '\n';
+                        }
 
                         uint32_t dataAddr = 0;
                         bool hasPayload = (tagQwc > 0);
@@ -1477,23 +1514,28 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
-                        const bool compactVifLocalTag =
-                            (channelBase == 0x10009000u || channelBase == 0x10008000u) &&
-                            (id == 1u || id == 2u || id == 5u || id == 6u || id == 7u);
-                        if (compactVifLocalTag)
-                            appendCompactVif1TagData(currentTagAddr, 0u);
+                        const bool vifChainTag =
+                            (channelBase == 0x10009000u || channelBase == 0x10008000u);
+                        if (vifChainTag)
+                            appendVifTagUpper(currentTagAddr);
 
                         if (hasPayload)
-                        {
-                            if (compactVifLocalTag)
-                                appendData(currentTagAddr + 16u, tagQwc);
-                            else
-                                appendData(dataAddr, tagQwc);
-                        }
+                            appendData(dataAddr, tagQwc);
                         if (irq && tieEnabled)
                             endChain = true;
+
                         if (endChain)
                             break;
+                    }
+
+                    static std::atomic<uint32_t> chainProbes{0u};
+                    const uint32_t chainProbe = chainProbes.fetch_add(1u, std::memory_order_relaxed);
+                    if (chainProbe < 64u)
+                    {
+                        std::cerr << "[probe:dma-chain] ch=0x" << std::hex << channelBase
+                                  << " tags=" << std::dec << tagsProcessed
+                                  << " bytes=0x" << std::hex << chainBuf.size()
+                                  << " start=0x" << tadr << " end=0x" << tagAddr << std::dec << '\n';
                     }
 
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
@@ -1567,6 +1609,11 @@ void PS2Memory::processPendingTransfers()
         auto &p = m_pendingGifTransfers[idx];
         if (!p.chainData.empty())
         {
+            static std::atomic<uint32_t> gifSubmits{0u};
+            const uint32_t gifProbe = gifSubmits.fetch_add(1u, std::memory_order_relaxed);
+            if (gifProbe < 64u)
+                std::cerr << "[probe:gif-submit] kind=chain bytes=0x" << std::hex
+                          << p.chainData.size() << std::dec << '\n';
             m_seenGifCopy = true;
             m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
             submitGifPacket(GifPathId::Path3, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), false);
@@ -1616,6 +1663,11 @@ void PS2Memory::processPendingTransfers()
                     if (chunk == 0)
                         break;
                     m_seenGifCopy = true;
+                    static std::atomic<uint32_t> gifSubmits{0u};
+                    const uint32_t gifProbe = gifSubmits.fetch_add(1u, std::memory_order_relaxed);
+                    if (gifProbe < 64u)
+                        std::cerr << "[probe:gif-submit] kind=linear bytes=0x" << std::hex
+                                  << chunk << " src=0x" << srcPhys << std::dec << '\n';
                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
                     submitGifPacket(GifPathId::Path3, m_rdram + srcPhys, chunk, false);
                     bytesLeft -= chunk;
@@ -1830,6 +1882,33 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 {
     if (!data || sizeBytes < 16)
         return;
+
+    static std::atomic<uint32_t> gifPathSubmits{0u};
+    const uint32_t gifPathProbe = gifPathSubmits.fetch_add(1u, std::memory_order_relaxed);
+    uint64_t probeTag = 0u;
+    std::memcpy(&probeTag, data, sizeof(probeTag));
+    const bool imageTag = ((probeTag >> 58u) & 0x3u) == 2u;
+    if (gifPathProbe < 128u)
+    {
+        std::cerr << "[probe:gif-path] path=" << ((pathId == GifPathId::Path2) ? 2 : 3)
+                  << " bytes=0x" << std::hex << sizeBytes
+                  << " tag=0x" << probeTag
+                  << " directhl=" << (path2DirectHl ? 1 : 0) << std::dec << '\n';
+    }
+    if (imageTag)
+    {
+        static std::atomic<uint32_t> imagePathProbes{0u};
+        const uint32_t imageProbe = imagePathProbes.fetch_add(1u, std::memory_order_relaxed);
+        if (imageProbe < 32u)
+        {
+            uint32_t first = 0u;
+            if (sizeBytes >= 20u)
+                std::memcpy(&first, data + 16u, sizeof(first));
+            std::cerr << "[probe:gif-image-path] path=" << ((pathId == GifPathId::Path2) ? 2 : 3)
+                      << " nloop=0x" << std::hex << (probeTag & 0x7FFFu)
+                      << " bytes=0x" << sizeBytes << " first=0x" << first << std::dec << '\n';
+        }
+    }
 
     if (pathId == GifPathId::Path3)
     {

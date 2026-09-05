@@ -644,6 +644,19 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
+    static std::atomic<uint32_t> packetProbes{0u};
+    const uint32_t packetProbe = packetProbes.fetch_add(1u, std::memory_order_relaxed);
+    if (packetProbe < 96u)
+    {
+        const uint64_t tagLo = loadLE64(data);
+        const uint64_t tagHi = loadLE64(data + 8u);
+        std::cerr << "[probe:gs-packet] n=" << packetProbe
+                  << " size=0x" << std::hex << sizeBytes
+                  << " lo=0x" << tagLo << " hi=0x" << tagHi
+                  << " fbp0=0x" << m_ctx[0].frame.fbp
+                  << " prim=0x" << m_prim.type << std::dec << '\n';
+    }
+
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
 
@@ -683,6 +696,28 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         if (nreg == 0)
             nreg = 16;
 
+        if (flg == GIF_FMT_IMAGE)
+        {
+            static std::atomic<uint32_t> imageTagProbes{0u};
+            const uint32_t imageTagProbe = imageTagProbes.fetch_add(1u, std::memory_order_relaxed);
+            if (imageTagProbe < 32u)
+            {
+                const uint32_t imageBytes = nloop * 16u;
+                uint32_t first = 0u;
+                uint32_t nonzero = 0u;
+                if (offset + 4u <= sizeBytes)
+                    std::memcpy(&first, data + offset, sizeof(first));
+                const uint32_t available = std::min<uint32_t>(imageBytes, sizeBytes - offset);
+                for (uint32_t i = 0u; i < available; ++i)
+                    nonzero += (data[offset + i] != 0u) ? 1u : 0u;
+                std::cerr << "[probe:gs-image-tag] nloop=0x" << std::hex << nloop
+                          << " bytes=0x" << imageBytes << " first=0x" << first << " nonzero=0x" << nonzero
+                          << " dbp=0x" << m_bitbltbuf.dbp << " dpsm=0x" << static_cast<unsigned>(m_bitbltbuf.dpsm)
+                          << " frame=0x" << m_ctx[0].frame.fbp
+                          << " packet=0x" << sizeBytes << std::dec << '\n';
+            }
+        }
+
         recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
 
         bool pre = ((tagLo >> 46) & 1) != 0;
@@ -718,7 +753,17 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                 {
                     if (offset + 8 > sizeBytes)
                         return;
-                    writeRegisterUnlocked(regs[r], loadLE64(data + offset));
+                    const uint64_t value = loadLE64(data + offset);
+                    if ((regs[r] == GS_REG_XYZ2 || regs[r] == GS_REG_XYZ3) && m_vtxCount < 8u)
+                    {
+                        static uint32_t regListVertexProbe = 0u;
+                        if (regListVertexProbe++ < 32u)
+                            std::cerr << "[probe:gs-reglist-vertex] reg=0x" << std::hex
+                                      << static_cast<uint32_t>(regs[r]) << " value=0x" << value
+                                      << " prim=0x" << static_cast<uint32_t>(m_prim.type)
+                                      << " before_vtx=" << std::dec << m_vtxCount << std::endl;
+                    }
+                    writeRegisterUnlocked(regs[r], value);
                     offset += 8;
                 }
             }
@@ -733,6 +778,15 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             processImageData(data + offset, imageBytes);
             offset += imageBytes;
         }
+    }
+
+    if (packetProbe < 96u)
+    {
+        std::cerr << "[probe:gs-packet-after] n=" << packetProbe
+                  << " fbp0=0x" << std::hex << m_ctx[0].frame.fbp
+                  << " fbw0=0x" << static_cast<unsigned>(m_ctx[0].frame.fbw)
+                  << " prim=0x" << static_cast<unsigned>(m_prim.type)
+                  << " vtx=" << std::dec << m_vtxCount << '\n';
     }
 }
 
@@ -796,6 +850,22 @@ void GS::uploadImageNativeUnlocked(uint64_t bitbltbuf,
 {
     if (!data || sizeBytes == 0 || !m_backend)
         return;
+
+    static std::atomic<uint32_t> imageProbes{0u};
+    const uint32_t imageProbe = imageProbes.fetch_add(1u, std::memory_order_relaxed);
+    if (imageProbe < 32u)
+    {
+        uint32_t first = 0u;
+        std::memcpy(&first, data, std::min<uint32_t>(4u, sizeBytes));
+        uint32_t nonzero = 0u;
+        for (uint32_t i = 0u; i < sizeBytes; ++i)
+            nonzero += (data[i] != 0u) ? 1u : 0u;
+        std::cerr << "[probe:gs-image] n=" << imageProbe
+                  << " bytes=0x" << std::hex << sizeBytes
+                  << " bitblt=0x" << bitbltbuf << " trxpos=0x" << trxpos
+                  << " trxreg=0x" << trxreg << " dir=0x" << trxdir
+                  << " first=0x" << first << " nonzero=0x" << nonzero << std::dec << '\n';
+    }
 
     writeRegisterUnlocked(GS_REG_BITBLTBUF, bitbltbuf);
     writeRegisterUnlocked(GS_REG_TRXPOS, trxpos);
@@ -877,6 +947,13 @@ bool GS::tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeByt
 
 void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 {
+    if (regDesc == GS_REG_PRIM)
+    {
+        static std::atomic<uint32_t> primProbes{0u};
+        const uint32_t primProbe = primProbes.fetch_add(1u, std::memory_order_relaxed);
+        if (primProbe < 32u)
+            std::cerr << "[probe:gs-prim-reg] value=0x" << std::hex << lo << std::dec << '\n';
+    }
     switch (regDesc)
     {
     case 0x00:

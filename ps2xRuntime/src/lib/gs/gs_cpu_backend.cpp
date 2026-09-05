@@ -639,6 +639,25 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const auto &ctx = state.context;
+    static uint32_t drawProbe = 0u;
+    if (drawProbe++ < 32u)
+        std::cerr << "[probe:gs-draw-submit] type=" << static_cast<uint32_t>(state.prim.type)
+                  << " vertices=" << static_cast<uint32_t>(batch.vertexCount)
+                  << " ctxt=" << static_cast<uint32_t>(state.prim.ctxt)
+                  << " frame=" << ctx.frame.fbp << " xyoff=" << (ctx.xyoffset.ofx >> 4)
+                  << "," << (ctx.xyoffset.ofy >> 4) << " scissor=" << ctx.scissor.x0
+                  << ".." << ctx.scissor.x1 << "," << ctx.scissor.y0 << ".." << ctx.scissor.y1
+                  << " test=0x" << std::hex << ctx.test
+                  << std::dec << " v0=" << batch.vertices[0].x << "," << batch.vertices[0].y
+                  << " v1=" << batch.vertices[1].x << "," << batch.vertices[1].y
+                  << " v2=" << batch.vertices[2].x << "," << batch.vertices[2].y
+                  << " rgba=" << static_cast<uint32_t>(batch.vertices[1].r) << ","
+                  << static_cast<uint32_t>(batch.vertices[1].g) << ","
+                  << static_cast<uint32_t>(batch.vertices[1].b) << ","
+                  << static_cast<uint32_t>(batch.vertices[1].a)
+                  << " tex0=" << ctx.tex0.tbp0 << "/" << static_cast<uint32_t>(ctx.tex0.psm)
+                  << " tcc=" << static_cast<uint32_t>(ctx.tex0.tcc)
+                  << " tfx=" << static_cast<uint32_t>(ctx.tex0.tfx) << std::endl;
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
         if (primitiveIndex < 64u)
@@ -776,6 +795,16 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
 {
     const auto &ctx = state.context;
+    static uint32_t writePixelProbe = 0u;
+    const bool tracePixel = (ctx.frame.fbp != 0u && (z != 0 || r != 0 || g != 0 || b != 0 || a != 0) && writePixelProbe++ < 64u);
+    if (tracePixel)
+        std::cerr << "[probe:gs-write-pixel] xy=" << x << "," << y
+                  << " z=0x" << std::hex << static_cast<uint32_t>(z)
+                  << " rgba=" << static_cast<uint32_t>(r) << "," << static_cast<uint32_t>(g)
+                  << "," << static_cast<uint32_t>(b) << "," << static_cast<uint32_t>(a)
+                  << " test=0x" << ctx.test << " frame=" << std::dec << ctx.frame.fbp
+                  << " scissor=" << ctx.scissor.x0 << ".." << ctx.scissor.x1
+                  << "," << ctx.scissor.y0 << ".." << ctx.scissor.y1 << std::endl;
     if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
         return;
 
@@ -804,6 +833,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         return;
     }
 
+    const bool ztestEnabled = (ctx.test & (1ull << 16u)) != 0ull;
     const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
     const bool alphaBlendEnabled = state.prim.abe;
     const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && fpsm == GS_PSM_CT32;
@@ -836,28 +866,34 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         return;
     }
 
-    bool zpass = false;
+    bool zpass = true;
     uint32_t storedZ = 0u;
-    switch (ztestMethod)
+    if (ztestEnabled)
     {
-    case 0:
-        zpass = false;
-        break;
-    case 1:
-        zpass = true;
-        break;
-    case 2:
-        storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y);
-        zpass = static_cast<uint32_t>(z) >= storedZ;
-        break;
-    case 3:
-        storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y);
-        zpass = static_cast<uint32_t>(z) > storedZ;
-        break;
+        switch (ztestMethod)
+        {
+        case 0:
+            zpass = false;
+            break;
+        case 1:
+            zpass = true;
+            break;
+        case 2:
+            storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y);
+            zpass = static_cast<uint32_t>(z) >= storedZ;
+            break;
+        case 3:
+            storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y);
+            zpass = static_cast<uint32_t>(z) > storedZ;
+            break;
+        }
     }
 
     if (!zpass)
     {
+        if (tracePixel)
+            std::cerr << "[probe:gs-write-pixel-reject-z] stored=0x" << std::hex << storedZ
+                      << " method=" << std::dec << ztestMethod << std::endl;
         return;
     }
 
@@ -1110,6 +1146,13 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     const int drawY0 = clampInt(unclippedY0, ctx.scissor.y0, ctx.scissor.y1);
     const int drawX1 = clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
     const int drawY1 = clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
+    static uint32_t spriteProbe = 0u;
+    if (spriteProbe++ < 24u)
+        std::cerr << "[probe:gs-sprite-span] frame=" << ctx.frame.fbp
+                  << " raw=" << unclippedX0 << "," << unclippedY0 << ".." << unclippedX1
+                  << "," << unclippedY1 << " draw=" << drawX0 << "," << drawY0 << ".."
+                  << drawX1 << "," << drawY1 << " tme=" << static_cast<uint32_t>(state.prim.tme)
+                  << " tex=" << state.textureWidth << "x" << state.textureHeight << std::endl;
 
     const uint64_t alphaReg = ctx.alpha;
     const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
@@ -1774,6 +1817,7 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
 PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
 {
     PresentationFrame result{};
+    static uint32_t presentationLogCount = 0u;
     const GSPmodeState pmode = decodePmode(request.pmode);
     const GSSmode2State smode2 = decodeSMode2(request.smode2);
     const bool fieldMode = smode2.interlaced && !smode2.frameMode;
@@ -1788,7 +1832,13 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
     if (!valid1 && !valid2)
+    {
+        if (presentationLogCount++ < 32u)
+            std::cerr << "[present] invalid pmode=0x" << std::hex << request.pmode
+                      << " dispfb1=0x" << request.dispfb1
+                      << " display1=0x" << request.display1 << std::dec << std::endl;
         return result;
+    }
 
     auto copySource = [&](const GSFrameReg &displayFrame,
                           const GSDisplayReadOrigin &origin,
@@ -1822,7 +1872,15 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                 std::vector<uint8_t> candidatePixels;
                 if (!CopyFrameToHostRgba(candidate, width, height, candidatePixels, preserveAlpha, true, true, 0u, 0u))
                     continue;
-                if (countNonBlackPixels(candidatePixels, width, height) == 0u)
+                const uint32_t candidateNonBlack = countNonBlackPixels(candidatePixels, width, height);
+                static uint32_t fallbackProbeCount = 0u;
+                if ((fallbackProbeCount++ % 16u) == 0u)
+                    std::cerr << "[present:fallback-candidate] display_fbp=" << displayFrame.fbp
+                              << " candidate_fbp=" << candidate.fbp
+                              << " fbw=" << candidate.fbw
+                              << " psm=" << static_cast<uint32_t>(candidate.psm)
+                              << " nonblack=" << candidateNonBlack << std::endl;
+                if (candidateNonBlack == 0u)
                     continue;
                 selected = candidate;
                 pixels.swap(candidatePixels);
@@ -1874,6 +1932,11 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                 applyFieldPresentation(result.pixels, result.width, result.height, oddField);
             result.displayFbp = displayFrame1.fbp;
             result.sourceFbp = selected1.fbp;
+            if (presentationLogCount++ < 32u)
+                std::cerr << "[present] dual pmode=0x" << std::hex << request.pmode
+                          << " fbp1=" << displayFrame1.fbp << " fbp2=" << displayFrame2.fbp
+                          << " src1=" << selected1.fbp << " nonblack=" << std::dec
+                          << countNonBlackPixels(result.pixels, result.width, result.height) << std::endl;
             return result;
         }
     }
@@ -1890,5 +1953,11 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     normalizePresentationAlpha(result.pixels, result.width, result.height);
     result.displayFbp = displayFrame.fbp;
     result.sourceFbp = selected.fbp;
+    if (presentationLogCount++ < 32u)
+        std::cerr << "[present] single pmode=0x" << std::hex << request.pmode
+                  << " fbp=" << displayFrame.fbp << " src=" << selected.fbp
+                  << " width=" << std::dec << result.width << " height=" << result.height
+                  << " nonblack=" << countNonBlackPixels(result.pixels, result.width, result.height)
+                  << std::endl;
     return result;
 }

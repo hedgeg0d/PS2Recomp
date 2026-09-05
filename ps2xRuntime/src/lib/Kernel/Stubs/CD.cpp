@@ -601,6 +601,15 @@ namespace ps2_stubs
 
         CdFileEntry entry;
         bool found = registerCdFile(path, entry);
+        static uint32_t mappingProbeCount = 0u;
+        if (found && mappingProbeCount < 64u)
+        {
+            std::cerr << "[probe:cd-map] path=\"" << sanitizeForLog(path)
+                      << "\" base=0x" << std::hex << entry.baseLbn
+                      << " sectors=0x" << entry.sectors
+                      << " size=0x" << entry.sizeBytes << std::dec << std::endl;
+            ++mappingProbeCount;
+        }
         CdFileEntry resolvedEntry = entry;
         std::string resolvedPath;
 
@@ -985,5 +994,31 @@ namespace ps2_stubs
             *status = 0;
         }
         setReturnS32(ctx, 1);
+    }
+
+    bool readCdSectorsForIop(uint32_t lbn,
+                            uint32_t sectors,
+                            void *destination,
+                            size_t size)
+    {
+        const bool ok = readCdSectors(lbn,
+                                      sectors,
+                                      static_cast<uint8_t *>(destination),
+                                      size);
+        static uint32_t traceCount = 0u;
+        if (traceCount < 64u && destination != nullptr && size >= 16u)
+        {
+            const auto *bytes = static_cast<const uint8_t *>(destination);
+            std::cerr << "[probe:cd-iop] lbn=0x" << std::hex << lbn
+                      << " sectors=0x" << sectors << " size=0x" << size
+                      << " ok=" << ok << " bytes=";
+            for (uint32_t i = 0u; i < 16u; ++i)
+            {
+                std::cerr << (i == 0u ? "" : " ") << static_cast<uint32_t>(bytes[i]);
+            }
+            std::cerr << std::dec << std::endl;
+            ++traceCount;
+        }
+        return ok;
     }
 }

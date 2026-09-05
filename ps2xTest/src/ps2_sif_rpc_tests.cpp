@@ -319,6 +319,59 @@ void register_ps2_sif_rpc_tests()
 {
     MiniTest::Case("PS2SifRpc", [](TestCase &tc)
     {
+        tc.Run("sceSifSendCmd reads extra-copy arguments from EE registers", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t kSourceAddr = 0x00023000u;
+            constexpr uint32_t kRegisterDestination = 0x00023100u;
+            constexpr uint32_t kStackDestination = 0x00023200u;
+            constexpr uint32_t kStackAddr = 0x00023300u;
+            constexpr uint32_t kCopySize = 16u;
+
+            std::array<uint8_t, kCopySize> payload{};
+            for (size_t i = 0; i < payload.size(); ++i)
+            {
+                payload[i] = static_cast<uint8_t>(0x60u + i);
+            }
+            std::memcpy(env.rdram.data() + kSourceAddr, payload.data(), payload.size());
+            std::memset(env.rdram.data() + kRegisterDestination, 0, payload.size());
+            std::memset(env.rdram.data() + kStackDestination, 0, payload.size());
+            writeGuestU32(env.rdram.data(), kStackAddr + 0x10u, kStackDestination);
+            writeGuestU32(env.rdram.data(), kStackAddr + 0x14u, kCopySize);
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 0x24000u);
+            setRegU32(env.ctx, 6, 0x40u);
+            setRegU32(env.ctx, 7, kSourceAddr);
+            setRegU32(env.ctx, 8, kRegisterDestination);
+            setRegU32(env.ctx, 9, kCopySize);
+            setRegU32(env.ctx, 29, kStackAddr);
+
+            ps2_syscalls::sceSifSendCmd(env.rdram.data(), &env.ctx, &env.runtime);
+            t.IsTrue(std::memcmp(env.rdram.data() + kRegisterDestination,
+                                 payload.data(), payload.size()) == 0,
+                     "syscall should copy to register-supplied destination");
+            t.IsTrue(std::memcmp(env.rdram.data() + kStackDestination,
+                                 std::array<uint8_t, kCopySize>{}.data(), payload.size()) == 0,
+                     "syscall should not use stale o32 stack slots");
+
+            std::memset(env.rdram.data() + kRegisterDestination, 0, payload.size());
+            setRegU32(env.ctx, 8, 0u);
+            setRegU32(env.ctx, 9, 0u);
+            ps2_syscalls::sceSifSendCmd(env.rdram.data(), &env.ctx, &env.runtime);
+            t.IsTrue(std::memcmp(env.rdram.data() + kRegisterDestination,
+                                 std::array<uint8_t, kCopySize>{}.data(), payload.size()) == 0,
+                     "zero register arguments should disable the extra copy");
+
+            std::memset(env.rdram.data() + kRegisterDestination, 0, payload.size());
+            setRegU32(env.ctx, 8, kRegisterDestination);
+            setRegU32(env.ctx, 9, kCopySize);
+            ps2_stubs::sceSifSendCmd(env.rdram.data(), &env.ctx, &env.runtime);
+            t.IsTrue(std::memcmp(env.rdram.data() + kRegisterDestination,
+                                 payload.data(), payload.size()) == 0,
+                     "stub should use the same EE argument convention");
+        });
+
         tc.Run("register bind call updates descriptors and payload", [](TestCase &t)
         {
             TestEnv env;
@@ -826,7 +879,7 @@ void register_ps2_sif_rpc_tests()
             t.Equals(getRegS32(env.ctx, 2), 0, "RECVX snddrv client should no longer be RPC-busy");
         });
 
-        tc.Run("bind before register creates placeholder then remaps", [](TestCase &t)
+        tc.Run("bind before register stays unbound then remaps", [](TestCase &t)
         {
             TestEnv env;
 
@@ -846,11 +899,10 @@ void register_ps2_sif_rpc_tests()
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "initial bind without registered server should still succeed");
 
             const SifRpcClientData clientBeforeRegister = readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr);
-            t.IsTrue(clientBeforeRegister.server != 0u, "bind should allocate placeholder server when sid is missing");
-            t.IsTrue(clientBeforeRegister.server >= 0x01F10000u && clientBeforeRegister.server < 0x01F20000u,
-                     "placeholder server should come from rpc server pool");
-            t.Equals(clientBeforeRegister.buf, 0u, "placeholder server starts with empty buf");
-            t.Equals(clientBeforeRegister.cbuf, 0u, "placeholder server starts with empty cbuf");
+            t.Equals(clientBeforeRegister.server, 0u,
+                     "bind should leave the client unbound when the SID is missing");
+            t.Equals(clientBeforeRegister.buf, 0u, "unbound client should have no request buffer");
+            t.Equals(clientBeforeRegister.cbuf, 0u, "unbound client should have no completion buffer");
 
             setRegU32(env.ctx, 4, kQdAddr);
             setRegU32(env.ctx, 5, 0x44u);

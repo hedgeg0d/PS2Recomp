@@ -390,7 +390,7 @@ void register_ps2_runtime_expansion_tests()
             ctx.pc = 0x2000u;
 
             const bool returnedToFallthrough = runtime.dispatchGuestBranch(
-                nullptr,
+                runtime.memory().getRDRAM(),
                 &ctx,
                 0x3000u,
                 0x2000u,
@@ -416,7 +416,7 @@ void register_ps2_runtime_expansion_tests()
             ctx.pc = 0x2000u;
 
             const bool continuedInCaller = runtime.dispatchGuestBranch(
-                nullptr,
+                runtime.memory().getRDRAM(),
                 &ctx,
                 0x3400u,
                 0x2000u,
@@ -441,7 +441,7 @@ void register_ps2_runtime_expansion_tests()
             ctx.pc = 0x2000u;
 
             const bool returnedToFallthrough = runtime.dispatchGuestBranch(
-                nullptr,
+                runtime.memory().getRDRAM(),
                 &ctx,
                 0x3100u,
                 0x2000u,
@@ -465,7 +465,7 @@ void register_ps2_runtime_expansion_tests()
             ctx.pc = 0x2000u;
 
             const bool returnedToFallthrough = runtime.dispatchGuestBranch(
-                nullptr,
+                runtime.memory().getRDRAM(),
                 &ctx,
                 0x3210u,
                 0x2000u,
@@ -479,6 +479,28 @@ void register_ps2_runtime_expansion_tests()
                      "missing exact target should request runtime stop");
             t.Equals(ctx.pc, 0x3210u,
                      "missing target should remain visible in ctx->pc for diagnostics");
+        });
+
+        tc.Run("dispatchGuestBranch treats null indirect callbacks as no-op returns", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+
+            const bool resumed = runtime.dispatchGuestBranch(
+                runtime.memory().getRDRAM(),
+                &ctx,
+                0u,
+                0x2000u,
+                0x2008u,
+                PS2Runtime::GuestBranchKind::IndirectCall,
+                "test-null-callback");
+
+            t.IsTrue(resumed, "null callback should resume after the call delay slot");
+            t.Equals(ctx.pc, 0x2008u, "null callback should preserve the caller fallthrough PC");
+            t.IsTrue(runtime.isStopRequested(), "null callback remains visible to Stop diagnostics");
         });
 
         tc.Run("MPEG init and callback stubs return success instead of TODO errors", [](TestCase &t)
@@ -520,6 +542,65 @@ void register_ps2_runtime_expansion_tests()
             ps2_stubs::sceMpegAddCallback(rdram.data(), &addAfterReinit, nullptr);
             t.Equals(getRegS32(addAfterReinit, 2), 1,
                      "sceMpegInit should reset MPEG callback bookkeeping between runs");
+        });
+
+        tc.Run("sceMpegAddBs accepts PSS input without changing elementary-stream behavior", [](TestCase &t)
+        {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kInputAddr = 0x00124000u;
+            const std::vector<uint8_t> pss = {
+                0x00u, 0x00u, 0x01u, 0xBA,
+                0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u,
+                0x00u, 0x00u, 0x01u, 0xE0u, 0x00u, 0x0Bu,
+                0x80u, 0x00u, 0x00u,
+                0x00u, 0x00u, 0x01u, 0xB3u, 0x14u, 0x00u, 0xF0u, 0x13u};
+            std::memcpy(rdram.data() + kInputAddr, pss.data(), pss.size());
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kMpegAddr);
+            setRegU32(addCtx, 5, kInputAddr);
+            setRegU32(addCtx, 6, static_cast<uint32_t>(pss.size()));
+            ps2_stubs::sceMpegAddBs(rdram.data(), &addCtx, nullptr);
+
+            t.Equals(getRegS32(addCtx, 2), static_cast<int32_t>(pss.size()),
+                     "PSS passed through sceMpegAddBs should be consumed in full");
+        });
+
+        tc.Run("sceMpegAddBs recognizes PSS start codes split across submissions", [](TestCase &t)
+        {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kInputAddr = 0x00124000u;
+            const std::vector<uint8_t> prefix = {0x00u, 0x00u};
+            const std::vector<uint8_t> suffix = {
+                0x01u, 0xBAu,
+                0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u,
+                0x00u, 0x00u, 0x01u, 0xE0u, 0x00u, 0x03u,
+                0x80u, 0x00u, 0x00u};
+            std::memcpy(rdram.data() + kInputAddr, prefix.data(), prefix.size());
+            std::memcpy(rdram.data() + kInputAddr + prefix.size(), suffix.data(), suffix.size());
+
+            R5900Context first{};
+            setRegU32(first, 4, kMpegAddr);
+            setRegU32(first, 5, kInputAddr);
+            setRegU32(first, 6, static_cast<uint32_t>(prefix.size()));
+            ps2_stubs::sceMpegAddBs(rdram.data(), &first, nullptr);
+
+            R5900Context second{};
+            setRegU32(second, 4, kMpegAddr);
+            setRegU32(second, 5, kInputAddr + static_cast<uint32_t>(prefix.size()));
+            setRegU32(second, 6, static_cast<uint32_t>(suffix.size()));
+            ps2_stubs::sceMpegAddBs(rdram.data(), &second, nullptr);
+
+            t.Equals(getRegS32(first, 2), static_cast<int32_t>(prefix.size()),
+                     "the first split PSS submission should be fully consumed");
+            t.Equals(getRegS32(second, 2), static_cast<int32_t>(suffix.size()),
+                     "the second split PSS submission should be fully consumed");
         });
 
         tc.Run("sceMpegDemuxPssRing dispatches registered video and audio stream callbacks", [](TestCase &t)
@@ -770,8 +851,11 @@ void register_ps2_runtime_expansion_tests()
             mainContext.pc = kMpegNoDuplicateMainPc;
             EeScheduler &ee = runtime.eeScheduler();
             ee.reset(rdram.data(), mainContext);
+            // The producer shares the default main thread priority so the FIFO
+            // dispatch runs the main thread first: only once the second
+            // GetPicture blocks does the producer observe stage 1 and post EOF.
             const int producerId = ee.createThread(EeThreadCreateParams{
-                0u, kMpegNoDuplicateProducerPc, 0u, 0u, 0u, 10, 0u});
+                0u, kMpegNoDuplicateProducerPc, 0u, 0u, 0u, EeScheduler::kPriorityCount - 1, 0u});
             t.IsTrue(producerId > 1, "MPEG producer guest thread should be created");
             t.Equals(ee.startThread(producerId, 0u, mainContext, false), 0,
                      "MPEG producer guest thread should become ready");

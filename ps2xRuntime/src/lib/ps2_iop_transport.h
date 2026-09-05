@@ -26,6 +26,18 @@ public:
                    : ps2x::iop::RpcAbi::RuntimeDefault;
     }
 
+    [[nodiscard]] static bool hasRpcService(const PS2Runtime *runtime, uint32_t sid)
+    {
+        return runtime && runtime->hasIopRpcService(sid);
+    }
+
+    [[nodiscard]] static uint32_t allocateIopHandle(
+        PS2Runtime *runtime,
+        ps2x::iop::IopHandleKind kind)
+    {
+        return runtime ? runtime->allocateIopHandle(kind) : 0u;
+    }
+
     [[nodiscard]] static ps2x::iop::RpcResult handleRpc(
         PS2Runtime *runtime,
         uint8_t *rdram,

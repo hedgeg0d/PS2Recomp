@@ -243,13 +243,70 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)valueLo;
     (void)valueHi;
     (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    // Throwaway boot diagnostics (removed before contribution): log guest
+    // stores that touch the Katamari boot-gate state being investigated.
+    static constexpr uint32_t kWatched[] = {
+        0x00987900u, // load queue count
+        0x0101D42Cu, // filectrl client state word
+        0x0054EA20u, // seg2 tick marker
+        0x0054EA85u, // boot loader ready byte
+        0x0054EA94u, // boot loader counter
+        0x00F6D278u, // task-walk gate flag
+        0x00F6D280u, // task list head
+        0x0101D3B7u, // subsystem busy byte at P+0x37
+        0x0101BDE4u, // boot SM state word (0x101BDD0+0x14)
+        0x0101BDE0u, // boot SM idx word (TEMP-EXPERIMENT, revert)
+        0x0101D450u, // decoder qwords doorbell (producer 186874 / consumer 188034)
+    };
+    static std::atomic<uint32_t> s_watchLogCount{0u};
+    // Throwaway boot diagnostics (removed before contribution): guest stores may
+    // arrive through the uncached RAM mirror (0x20000000..0x3FFFFFFF) or kseg0,
+    // so compare the physical address, not the raw virtual one.
+    const uint32_t normAddr = guestAddr & 0x1FFFFFFFu;
+    for (const uint32_t watched : kWatched)
+    {
+        const bool busyRange = (normAddr >= 0x0101D3B0u && normAddr < 0x0101D3C0u) ||
+                               (normAddr >= 0x0101DB70u && normAddr < 0x0101DB80u);
+        const bool crtClear = ctx != nullptr && ctx->pc == 0x100018u;
+        if ((normAddr == watched || busyRange) && !crtClear &&
+            s_watchLogCount.fetch_add(1u, std::memory_order_relaxed) < 200u)
+        {
+            std::cerr << "[probe:store] addr=0x" << std::hex << guestAddr
+                      << " size=" << std::dec << size
+                      << " value=0x" << std::hex << valueLo
+                      << " pc=0x" << (ctx ? ctx->pc : 0u) << std::dec << std::endl;
+        }
+    }
+    // Track who installs the subsystem client data pointer (cached/uncached).
+    if (size == 4u &&
+        (valueLo == 0x0101DB40u || valueLo == 0x2101DB40u ||
+         valueLo == 0x0101D380u || valueLo == 0x2101D380u) &&
+        s_watchLogCount.fetch_add(1u, std::memory_order_relaxed) < 200u)
+    {
+        std::cerr << "[probe:ptr] addr=0x" << std::hex << guestAddr
+                  << " value=0x" << valueLo
+                  << " pc=0x" << (ctx ? ctx->pc : 0u) << std::dec << std::endl;
+    }
+    // Watch registrations of the boot state controller into callback tables.
+    if (size == 4u &&
+        (valueLo == 0x165560u || valueLo == 0x165430u || valueLo == 0x1654d0u ||
+         valueLo == 0x165ba0u || valueLo == 0x165c40u || valueLo == 0x165e30u ||
+         valueLo == 0x1658d0u || valueLo == 0x100978u || valueLo == 0x1770c0u) &&
+        s_watchLogCount.fetch_add(1u, std::memory_order_relaxed) < 60u)
+    {
+        std::cerr << "[probe:reg] addr=0x" << std::hex << guestAddr
+                  << " value=0x" << valueLo
+                  << " pc=0x" << (ctx ? ctx->pc : 0u) << std::dec << std::endl;
+    }
+    if ((size == 4u || size == 8u || size == 16u) &&
+        static_cast<uint32_t>(valueLo) == 0x54DAC0u && guestAddr >= 0x1FF00000u)
+    {
+        std::cerr << "[probe:stack54dac0] addr=0x" << std::hex << guestAddr
+                  << " pc=0x" << (ctx ? ctx->pc : 0u) << " sp=0x"
+                  << (ctx ? getRegU32(ctx, 29) : 0u) << std::dec << std::endl;
+    }
 }
 
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
@@ -263,6 +320,22 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
     (void)size;
     (void)op;
     (void)ctx;
+    // Throwaway boot diagnostics: IOP/RPC completion writes use the range
+    // helper rather than the scalar store helper. Keep the uncached mirror
+    // visible while locating the subsystem busy-byte completion path.
+    const uint32_t normAddr = guestAddr & 0x1FFFFFFFu;
+    const bool touchesBusy = (normAddr < 0x0101DB80u &&
+                              normAddr + size > 0x0101DB70u);
+    if (touchesBusy)
+    {
+        static std::atomic<uint32_t> s_rangeWatchLogCount{0u};
+        if (s_rangeWatchLogCount.fetch_add(1u, std::memory_order_relaxed) < 200u)
+        {
+            std::cerr << "[probe:range] addr=0x" << std::hex << guestAddr
+                      << " size=0x" << size << " op=" << (op ? op : "?")
+                      << std::dec << std::endl;
+        }
+    }
     // TODO we dont need this anymore so on next release it will be deleted
 }
 
@@ -327,6 +400,12 @@ public:
     bool registerFunction(uint32_t address, RecompiledFunction func);
     RecompiledFunction lookupFunction(uint32_t address);
     bool hasFunction(uint32_t address) const;
+    // Forwards the emulated vsync boundary to IOP services (pad autopoll).
+    void notifyIopVBlank();
+    // TEMP-EXPERIMENT: 1Hz guest-state trace for HW diff. Revert.
+    void dumpGuestStateTrace();
+    // TEMP-EXPERIMENT: one-shot full RDRAM dump for HW diff. Revert.
+    void dumpGuestRam(const char *path);
     bool dispatchGuestBranch(uint8_t *rdram,
                              R5900Context *ctx,
                              uint32_t targetPc,
@@ -463,6 +542,8 @@ private:
     void HandleIntegerOverflow(R5900Context *ctx);
 
     [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
+    [[nodiscard]] bool hasIopRpcService(uint32_t sid) const;
+    [[nodiscard]] uint32_t allocateIopHandle(ps2x::iop::IopHandleKind kind);
     [[nodiscard]] ps2x::iop::RpcResult handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
     void resetIop();
@@ -485,6 +566,7 @@ private:
     mutable std::mutex m_eeKernelStateMutex;
     std::unordered_map<int, std::vector<EeExitHandlerRegistration>> m_eeExitHandlers;
     std::unordered_map<uint32_t, uint32_t> m_eeSyscallOverrides;
+    std::unordered_map<uint32_t, uint64_t> m_bootWatchCounts;
     std::unordered_set<uint32_t> m_eeSyscallMirrorAddresses;
     mutable std::mutex m_guestHeapMutex;
     mutable std::mutex m_asyncCallbackStackMutex;

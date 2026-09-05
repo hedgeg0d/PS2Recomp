@@ -38,6 +38,15 @@ namespace ps2_syscalls
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
             const int result = ee.signalSemaphore(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
             setReturnS32(ctx, result);
+            {
+                static uint32_t semaSignalSrcCount = 0u;
+                if (semaSignalSrcCount++ < 256u)
+                {
+                    std::cerr << "[probe:sema-src] id=" << getRegU32(ctx, 4)
+                              << " pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
+                              << " ra=0x" << getRegU32(ctx, 31) << std::dec << '\n';
+                }
+            }
             ee.transferIfRequested(interruptSafe);
         }
 

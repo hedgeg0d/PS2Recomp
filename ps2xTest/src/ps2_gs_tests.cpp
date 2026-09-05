@@ -2230,6 +2230,47 @@ void register_ps2_gs_tests()
             t.IsTrue(same, "native load-image upload should preserve pixel payload");
         });
 
+        tc.Run("native image upload honors a nonzero destination base", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            const uint64_t bitblt =
+                (static_cast<uint64_t>(1u) << 16) |  // SBW
+                (static_cast<uint64_t>(32u) << 32) | // DBP
+                (static_cast<uint64_t>(1u) << 48);   // DBW
+            const uint64_t trxreg = (2ull << 0) | (2ull << 32);
+            const uint8_t payload[16] = {
+                0x10u, 0x11u, 0x12u, 0x13u,
+                0x20u, 0x21u, 0x22u, 0x23u,
+                0x30u, 0x31u, 0x32u, 0x33u,
+                0x40u, 0x41u, 0x42u, 0x43u,
+            };
+
+            gs.uploadImageNative(bitblt, 0ull, trxreg, 0ull, payload, sizeof(payload));
+
+            bool destinationMatches = true;
+            bool sourceIsUntouched = true;
+            for (uint32_t y = 0; y < 2u; ++y)
+            {
+                for (uint32_t x = 0; x < 2u; ++x)
+                {
+                    const uint32_t pixelIndex = y * 2u + x;
+                    const uint32_t destinationOffset = referenceAddrPSMCT32(32u, 1u, x, y);
+                    const uint32_t sourceOffset = referenceAddrPSMCT32(0u, 1u, x, y);
+                    for (uint32_t c = 0; c < 4u; ++c)
+                    {
+                        destinationMatches &= vram[destinationOffset + c] == payload[pixelIndex * 4u + c];
+                        sourceIsUntouched &= vram[sourceOffset + c] == 0u;
+                    }
+                }
+            }
+
+            t.IsTrue(destinationMatches, "native upload should write pixels at DBP");
+            t.IsTrue(sourceIsUntouched, "native upload should not write pixels at SBP");
+        });
+
         tc.Run("GS local-to-host transfer supports partial incremental reads", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
@@ -3656,6 +3697,18 @@ void register_ps2_gs_tests()
                      "a passing alpha test should write the framebuffer");
             t.Equals(result.depth, 0x11111111u,
                      "ZMSK should preserve depth");
+        });
+
+        tc.Run("GS disabled depth test allows framebuffer writes regardless of ZTST", [](TestCase &t)
+        {
+            const GsPixelTestResult result =
+                drawGsPixelForTests(GS_PSM_CT32, 0ull, false,
+                                    0xAB030201u, 0x11111111u, 0x80u);
+
+            t.Equals(result.framebuffer, 0x80563412u,
+                     "ZTE=0 should allow a framebuffer write even when ZTST is NEVER");
+            t.Equals(result.depth, 0x22222222u,
+                     "an enabled depth write should update depth when ZTE is clear");
         });
 
         tc.Run("GS DATE and DATM inspect the framebuffer-format alpha bit", [](TestCase &t)

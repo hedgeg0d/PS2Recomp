@@ -293,6 +293,50 @@ void register_ps2_runtime_io_tests()
             fioClose(test.rdram.data(), &test.ctx, nullptr);
         });
 
+        tc.Run("fioGetstat reports configured files and directories", [](TestCase &t)
+        {
+            TestContext test;
+
+            const std::filesystem::path hostFile = test.paths.mcRoot / "stat.bin";
+            const std::string payload = "stat";
+            {
+                std::ofstream out(hostFile, std::ios::binary);
+                out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+            }
+
+            constexpr uint32_t kPathAddr = GUEST_STRING_AREA_START + 0x200u;
+            constexpr uint32_t kStatAddr = GUEST_BUFFER_AREA_START + 0x1800u;
+            writeGuestString(test.rdram.data(), kPathAddr, "mc0:/stat.bin");
+            std::memset(test.rdram.data() + kStatAddr, 0xCD, 40u);
+
+            setRegU32(test.ctx, 4, kPathAddr);
+            setRegU32(test.ctx, 5, kStatAddr);
+            fioGetstat(test.rdram.data(), &test.ctx, nullptr);
+
+            t.Equals(getRegS32(&test.ctx, 2), 0, "fioGetstat should succeed for an existing file");
+            t.Equals(readGuestU32(test.rdram.data(), kStatAddr + 0u), 0x0010u,
+                     "fioGetstat should report a regular file mode");
+            t.Equals(readGuestU32(test.rdram.data(), kStatAddr + 8u),
+                     static_cast<uint32_t>(payload.size()),
+                     "fioGetstat should report the file size");
+            t.Equals(readGuestU32(test.rdram.data(), kStatAddr + 36u), 0u,
+                     "fioGetstat should report a zero high file size for small files");
+
+            writeGuestString(test.rdram.data(), kPathAddr, "mc0:/");
+            setRegU32(test.ctx, 4, kPathAddr);
+            setRegU32(test.ctx, 5, kStatAddr);
+            fioGetstat(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(getRegS32(&test.ctx, 2), 0, "fioGetstat should succeed for an existing directory");
+            t.Equals(readGuestU32(test.rdram.data(), kStatAddr + 0u), 0x0020u,
+                     "fioGetstat should report a directory mode");
+
+            writeGuestString(test.rdram.data(), kPathAddr, "mc0:/missing.bin");
+            setRegU32(test.ctx, 4, kPathAddr);
+            setRegU32(test.ctx, 5, kStatAddr);
+            fioGetstat(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(getRegS32(&test.ctx, 2), -1, "fioGetstat should fail for a missing path");
+        });
+
         tc.Run("mc0 paths isolated from cdRoot", [](TestCase &t)
         {
             TestContext test;

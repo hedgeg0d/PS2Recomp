@@ -33,6 +33,12 @@ namespace ps2x::iop::detail
             (void)transfer;
         }
 
+        // Emulated vsync boundary (mirrors the SIO2 autopoll tick that
+        // refreshes pad buffers on real hardware).
+        virtual void onVBlank()
+        {
+        }
+
         virtual void appendDebugMetrics(std::vector<DebugMetric> &metrics) const
         {
             (void)metrics;

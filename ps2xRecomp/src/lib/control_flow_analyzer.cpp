@@ -109,6 +109,10 @@ namespace ps2recomp
                 result.entryPoints.insert(resumeAddr);
                 result.resumeEntryPoints.insert(resumeAddr);
             }
+            else
+            {
+                queueExternalEntryTarget(resumeAddr);
+            }
         };
 
         auto queueLoopResumeEntryTarget = [&](uint32_t target, uint32_t sourcePc)
@@ -147,6 +151,13 @@ namespace ps2recomp
             if (inst.isBranch && inst.opcode != OPCODE_J && inst.opcode != OPCODE_JAL)
             {
                 const int32_t offsetBytes = (static_cast<int32_t>(static_cast<int16_t>(inst.simmediate)) << 2);
+                // The predecessor executes its delay slot even if a map
+                // boundary lies on that slot. Its PC+8 continuation may then
+                // need an entry inside the next mapped function.
+                if (inst.hasDelaySlot)
+                {
+                    queueExternalEntryTarget(inst.address + 8u);
+                }
                 const uint32_t target = static_cast<uint32_t>(
                     static_cast<int64_t>(inst.address + 4u) + static_cast<int64_t>(offsetBytes));
 

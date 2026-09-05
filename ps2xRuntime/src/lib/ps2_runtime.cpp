@@ -6,10 +6,12 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/code_overlays.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
+#include "Kernel/Stubs/SIF.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
@@ -17,6 +19,7 @@
 #include <iostream>
 #include <fstream>
 #include <algorithm>
+#include <map>
 #include <array>
 #include <cctype>
 #include <cstring>
@@ -26,11 +29,28 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#include <mutex>
 
-namespace ps2_stubs
+namespace
 {
-    void resetSifState();
+    struct MissingTargetReports
+    {
+        std::mutex mutex;
+        std::map<const PS2Runtime *, std::vector<uint64_t>> targets;
+    };
+
+    MissingTargetReports &missingTargetReports()
+    {
+        // Global runtime instances may outlive function-local statics during
+        // shutdown. Entries are erased with each VM; keep the registry alive.
+        static auto *reports = new MissingTargetReports;
+        return *reports;
+    }
 }
+
+#ifndef PS2_TRACE_CALL_WATCH
+#define PS2_TRACE_CALL_WATCH 0
+#endif
 
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
 #define ET_EXEC 2            // Executable file
@@ -375,31 +395,15 @@ namespace
 
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
-    static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-    static bool s_hasLatchedInitialFrame = false;
-    static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
-    static uint32_t s_lastSourceFbp = std::numeric_limits<uint32_t>::max();
-    static bool s_lastPreferred = false;
-    static uint32_t s_lastWidth = 0u;
-    static uint32_t s_lastHeight = 0u;
-    static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
-    const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
-    if (needsLatch)
-    {
-        rt->gs().latchHostPresentationFrame();
-        s_lastPresentationTick = currentTick;
-        s_hasLatchedInitialFrame = true;
-    }
-    else if (s_hasUploadedFrame)
-    {
-        outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
-        outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
-        return;
-    }
+    // Presentation state belongs to the current runtime instance.  Do not
+    // cache it in function statics: a second run can reuse the same tick
+    // values and would otherwise display a stale framebuffer from the prior
+    // run.  Latching every host frame is inexpensive compared with the
+    // existing framebuffer copy and keeps presentation deterministic.
+    rt->gs().latchHostPresentationFrame();
 
     s_scratch.clear();
     uint32_t width = 0u;
@@ -419,36 +423,12 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         UnloadImage(blank);
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
-        s_lastWidth = outWidth;
-        s_lastHeight = outHeight;
-        s_hasUploadedFrame = true;
         return;
     }
 
-    PS2_IF_AGRESSIVE_LOGS({
-        static uint32_t s_uploadDebugCount = 0u;
-        if (s_uploadDebugCount < 128u ||
-            displayFbp != s_lastDisplayFbp ||
-            sourceFbp != s_lastSourceFbp ||
-            usedPreferredDisplaySource != s_lastPreferred ||
-            width != s_lastWidth ||
-            height != s_lastHeight)
-        {
-            std::cout << "[frame:upload] idx=" << s_uploadDebugCount
-                      << " tick=" << currentTick
-                      << " displayFbp=" << displayFbp
-                      << " sourceFbp=" << sourceFbp
-                      << " size=" << width << "x" << height
-                      << " preferred=" << static_cast<uint32_t>(usedPreferredDisplaySource ? 1u : 0u)
-                      << std::endl;
-        }
-        ++s_uploadDebugCount;
-    });
-    s_lastDisplayFbp = displayFbp;
-    s_lastSourceFbp = sourceFbp;
-    s_lastPreferred = usedPreferredDisplaySource;
-    s_lastWidth = width;
-    s_lastHeight = height;
+    (void)displayFbp;
+    (void)sourceFbp;
+    (void)usedPreferredDisplaySource;
 
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
@@ -474,11 +454,14 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     UpdateTexture(tex, s_uploadBuffer.data());
     outWidth = width;
     outHeight = height;
-    s_hasUploadedFrame = true;
 }
 
 PS2Runtime::PS2Runtime()
 {
+    // Diagnostics are intentionally retained during bring-up, but they must
+    // not force a host-side flush for every guest event.  Keep the same log
+    // stream and ordering while allowing libc to buffer writes in hot loops.
+    std::cerr << std::nounitbuf;
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
@@ -533,9 +516,12 @@ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
 
 PS2Runtime::~PS2Runtime()
 {
+    resetMissingFunctionReportOnce();
+    ps2x::clearCodeOverlays(this);
     try
     {
         requestStop();
+        ps2_stubs::resetSifRuntimeState(this);
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -581,6 +567,16 @@ ps2x::iop::RpcAbi PS2Runtime::selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &re
     return m_iopSubsystem->selectRpcAbi(request);
 }
 
+bool PS2Runtime::hasIopRpcService(uint32_t sid) const
+{
+    return m_iopSubsystem && m_iopSubsystem->hasRpcService(sid);
+}
+
+uint32_t PS2Runtime::allocateIopHandle(ps2x::iop::IopHandleKind kind)
+{
+    return m_iopHost ? m_iopHost->allocateIopHandle(kind) : 0u;
+}
+
 ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
 {
     auto scope = m_iopHost->enterCall(ctx, rdram);
@@ -596,6 +592,7 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
 
 void PS2Runtime::resetIop()
 {
+    ps2_stubs::resetSifRuntimeState(this);
     m_iopSubsystem->reset();
 }
 
@@ -624,6 +621,11 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
+                                     static std::atomic<uint32_t> vu1MscalProbes{0u};
+                                     const uint32_t vu1Probe = vu1MscalProbes.fetch_add(1u, std::memory_order_relaxed);
+                                     if (vu1Probe < 64u)
+                                         std::cerr << "[probe:vu1-mscal] start=0x" << std::hex << startPC
+                                                   << " top=0x" << top << " itop=0x" << itop << std::dec << '\n';
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -642,6 +644,11 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
+                                     static std::atomic<uint32_t> vu1MscntProbes{0u};
+                                     const uint32_t vu1Probe = vu1MscntProbes.fetch_add(1u, std::memory_order_relaxed);
+                                     if (vu1Probe < 64u)
+                                         std::cerr << "[probe:vu1-mscnt] top=0x" << std::hex << top
+                                                   << " itop=0x" << itop << std::dec << '\n';
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -935,8 +942,13 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
         const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        // Keep the unconfigured gap after the loaded image available for the
+        // compatibility callback pool. A title may configure an empty heap at
+        // the hard limit while still using that gap for static buffers;
+        // reserving callbacks from the physical RAM ceiling would then
+        // collide with those buffers.
+        m_asyncCallbackStackFloor = std::min(suggestedHeapBase, hardLimit);
+        m_asyncCallbackStackTop = hardLimit;
     }
 
     LoadedModule module;
@@ -1072,8 +1084,69 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
+    RecompiledFunction overlayFunction = nullptr;
+    if (ps2x::resolveCodeOverlay(this, address, overlayFunction))
+        return overlayFunction != nullptr;
     uint32_t slot = 0u;
     return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+}
+
+void PS2Runtime::notifyIopVBlank()
+{
+    if (m_iopSubsystem)
+    {
+        m_iopSubsystem->onVBlank();
+    }
+}
+
+// TEMP-EXPERIMENT: one-shot full RDRAM dump for HW diff. Revert.
+void PS2Runtime::dumpGuestRam(const char *path)
+{
+    const uint8_t *ram = m_memory.getRDRAM();
+    if (!ram || !path || !*path)
+    {
+        return;
+    }
+    FILE *f = std::fopen(path, "wb");
+    if (!f)
+    {
+        return;
+    }
+    std::fwrite(ram, 1, PS2_RAM_SIZE, f);
+    std::fclose(f);
+}
+
+// TEMP-EXPERIMENT: 1Hz guest-state trace for HW diff. Revert.
+void PS2Runtime::dumpGuestStateTrace()
+{
+    const uint8_t *ram = m_memory.getRDRAM();
+    if (!ram)
+    {
+        return;
+    }
+    auto rb = [ram](uint32_t a) -> uint32_t
+    { return a < PS2_RAM_SIZE ? ram[a] : 0xFFu; };
+    auto rw = [ram](uint32_t a) -> uint32_t
+    {
+        return a + 3u < PS2_RAM_SIZE
+                   ? (uint32_t)ram[a] | ((uint32_t)ram[a + 1u] << 8) |
+                         ((uint32_t)ram[a + 2u] << 16) | ((uint32_t)ram[a + 3u] << 24)
+                   : 0u;
+    };
+    std::printf("[state] vsync=%llu flow2708=0x%x flow271d=0x%x flow270a=0x%x "
+                "phase=0x%x cc=0x%x d0=0x%x cursor=0x%x q=0x%x decac=0x%x decst=0x%x\n",
+                (unsigned long long)m_memory.gs().vsyncTick.load(std::memory_order_relaxed),
+                rb(0x571188u),
+                rb(0x57119Du),
+                rb(0x57118Au),
+                rw(0x5611C0u),
+                rb(0x5611CCu),
+                rw(0x5611D0u),
+                rw(0x5611D4u),
+                rw(0x987900u),
+                rb(0x101D42Cu),
+                rb(0x101D45Eu));
+    std::fflush(stdout);
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -1099,8 +1172,12 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
 
+    RecompiledFunction overlayFunction = nullptr;
+    const bool overlayOwnsAddress = ps2x::resolveCodeOverlay(this, address, overlayFunction);
+    if (overlayFunction)
+        return overlayFunction;
     uint32_t slot = 0u;
-    if (generatedFunctionTableSlot(address, slot))
+    if (!overlayOwnsAddress && generatedFunctionTableSlot(address, slot))
     {
         RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
         if (fn != nullptr)
@@ -1143,6 +1220,9 @@ PS2Runtime::MissingFunctionPolicy PS2Runtime::missingFunctionPolicy() const
 void PS2Runtime::resetMissingFunctionReportOnce()
 {
     m_missingFunctionReported.store(false, std::memory_order_release);
+    auto &reports = missingTargetReports();
+    std::lock_guard<std::mutex> lock(reports.mutex);
+    reports.targets.erase(this);
 }
 
 void PS2Runtime::reportMissingFunction(uint8_t *rdram,
@@ -1154,6 +1234,20 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
 {
     const MissingFunctionPolicy policy = missingFunctionPolicy();
     const bool firstReport = !m_missingFunctionReported.exchange(true, std::memory_order_acq_rel);
+    bool reportTarget = false;
+    {
+        // A null optional callback must not hide subsequent missing code.
+        // Deduplicate call sites and bound diagnostic memory/output per VM.
+        auto &reports = missingTargetReports();
+        std::lock_guard<std::mutex> lock(reports.mutex);
+        auto &targets = reports.targets[this];
+        const uint64_t key = (static_cast<uint64_t>(sourcePc) << 32) | targetPc;
+        if (targets.size() < 64u && std::find(targets.begin(), targets.end(), key) == targets.end())
+        {
+            targets.push_back(key);
+            reportTarget = true;
+        }
+    }
 
     const uint32_t pc = ctx->pc;
     const uint32_t ra = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
@@ -1234,7 +1328,7 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
         readGuestU32Offset(a0Word0, 0x08u, vtableSlot8) &&
         readGuestU32Offset(a0Word0, 0x0cu, vtableSlotC);
 
-    if (firstReport)
+    if (reportTarget)
     {
         std::ostringstream oss;
         oss << "[guest-branch:missing-target] kind=" << describeGuestBranchKind(kind)
@@ -1311,13 +1405,236 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
+    // Unit callers may exercise branch dispatch before allocating guest RAM.
+    // Keep diagnostics and the dispatch contract safe in that case; generated
+    // game wrappers always pass the live RDRAM pointer.
+    static std::array<uint8_t, PS2_RAM_SIZE> nullRdram{};
+    if (!rdram)
+        rdram = nullRdram.data();
+
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+
+    // Temporary guard for accidental guest stack placement over active DMA
+    // buffers.  This catches nested calls that do not pass through the EE
+    // scheduler entry loop.
+    {
+        const uint32_t sp = getRegU32(ctx, 29);
+        if (sp >= 0x1E4D080u && sp < 0x1FEE7F0u)
+        {
+            static uint32_t overlapStackCallProbe = 0u;
+            if (overlapStackCallProbe < 64u)
+            {
+                std::cerr << "[probe:overlap-stack-call] target=0x" << std::hex << targetPc
+                          << " source=0x" << sourcePc << " sp=0x" << sp
+                          << " kind=" << debugName << std::dec << '\n';
+                ++overlapStackCallProbe;
+            }
+        }
+    }
+
+    if (targetPc == 0x185BF8u || targetPc == 0x1865E8u)
+    {
+        static uint32_t statusDispatchProbeCount = 0u;
+        if (statusDispatchProbeCount++ < 64u)
+        {
+            std::cerr << "[probe:filectrl-dispatch] target=0x" << std::hex << targetPc
+                      << " source=0x" << sourcePc << " fallthrough=0x" << fallthroughPc
+                      << " pc=0x" << ctx->pc << std::dec << '\n';
+        }
+    }
+
+    // Throwaway boot diagnostics (removed before contribution).
+    {
+        switch (targetPc)
+        {
+        case 0x16f9b0u: // load queue enqueue
+        case 0x16fa28u: // load queue processor
+        case 0x1862a8u: // dvd-open
+        case 0x108520u: // boot resource loader
+        case 0x16f960u: // queue wait/clear entry
+        case 0x16fb30u: // queue clear
+        case 0x1654d0u: // boot state helper
+        case 0x165560u: // boot state controller
+        case 0x165430u: // boot state controller sibling
+        case 0x181b10u: // per-frame call 1
+        case 0x167508u: // per-frame dispatcher
+        case 0x1675b8u: // boot/task dispatcher
+        case 0x167800u: // boot state machine handler
+        case 0x167908u: // boot state machine reset handler
+        case 0x167950u: // boot state machine task registration helper
+        case 0x167968u: // boot state machine task registration body
+        case 0x167998u: // boot callback gate helper
+        case 0x1679f8u: // boot callback lookup helper
+        case 0x167bd8u: // boot completion predicate
+        case 0x16ce20u: // sound-ready predicate
+        case 0x17f0a8u: // subsystem dispatch wrapper
+        case 0x10385e8u: // seg2 tick
+        case 0x1775f0u: // boot initial load step
+        case 0x181058u: // dvd read api
+        case 0x13d2c0u: // common file read api
+        case 0x13d4c0u: // indirect boot load step
+        case 0x175a18u: // frame subsystem a
+        case 0x167fd8u: // frame subsystem b
+        case 0x167f88u: // frame subsystem c
+        case 0x177148u: // frame subsystem d
+        case 0x176fc8u: // frame subsystem e (conditional)
+        case 0x168008u: // frame subsystem f
+        case 0x14dbb8u: // frame subsystem g
+        case 0x177bf8u: // frame subsystem h
+        case 0x16b1e0u: // frame subsystem i
+        case 0x16b4e0u: // frame subsystem j
+        case 0x17a4a0u: // frame subsystem k
+        case 0x17a0c0u: // frame subsystem l
+        case 0x18d338u: // audio tick a
+        case 0x18da58u: // audio tick b
+        case 0x1a7978u: // audio tick c
+        case 0x1a4108u: // audio tick d
+        case 0x1007a0u: // game module init step
+        case 0x100da0u: // task registration metadata helper
+        case 0x101af0u: // boot task setup wrapper
+        case 0x150368u: // module system init a
+        case 0x152cf8u: // module system init b
+        case 0x175b08u: // AddTask
+        case 0x175bf8u: // AddTask variant
+        case 0x175d78u: // deferred task starter
+        case 0x154578u: // boot task registration
+        case 0x100978u: // game system init block
+        case 0x16a8c8u: // init step 1
+        case 0x16aef8u: // init step 2
+        case 0x11aea8u: // init step 3
+        case 0x108af0u: // init step 4
+        case 0x1164b0u: // init step 5
+        case 0x11cd18u: // init step 6
+        case 0x100498u: // boot state machine tick
+        case 0x1018f0u: // boot sm wrapper
+        case 0x102c20u: // loader completion chain head
+        case 0x1031e0u: // loader completion chain
+        case 0x1034c0u: // loader completion chain caller
+        case 0x103538u: // gate-B writer caller
+        case 0x103578u: // gate-B writer wrapper
+        case 0x103640u: // gate-B writer ([0x56118A]=11)
+        case 0x100eb0u: // gate-A checker
+        case 0x167bccu: // setter chain head
+        case 0x167be8u: // setter chain
+        case 0x167c08u: // setter caller ([0x5611CC]=1, a0=2)
+        case 0x19f4a0u: // blocking call inside ticker pre-open path
+        case 0x185c68u: // pump transfer helper?
+        case 0x185c98u: // pump transfer helper?
+        case 0x180588u: // pump callee
+        case 0x180708u: // pump callee
+        case 0x19a958u: // dvd-open callee
+        case 0x169708u: // gate callee
+        case 0x14d578u: // gate callee
+        case 0x16d158u: // gate callee
+        case 0x177cc8u: // gate callee
+        case 0x100768u: // gate callee
+        case 0x16769cu: // ticker dvd-open pre-path (dead?)
+        case 0x1676a4u: // ticker dvd-open resume point
+        case 0x185ae0u: // pump callee
+        case 0x185b48u: // pump callee
+        case 0x185ba0u: // pump callee
+        case 0x186548u: // pump callee
+        case 0x1865b0u: // pump callee
+        case 0x1865e8u: // pump decoder-pump
+        case 0x187f98u: // pump decoder-setup
+        case 0x180780u: // pump callee
+        case 0x19a104u: // pump callee
+        case 0x19f070u: // pump callee
+        case 0x19f150u: // pump callee
+        case 0x17eed8u: // callback tree (fn=3 issuer?)
+        case 0x188f08u: // callback tree (fn=3 issuer?)
+        case 0x189610u: // callback tree (fn=3 issuer?)
+        case 0x188818u: // callback tree (fn=3 issuer?)
+        case 0x185078u: // callback tree (fn=3 issuer?)
+        case 0x19f110u: // callback tree
+        case 0x181ad8u: // callback tree
+        case 0x180198u: // callback tree
+        case 0x167388u: // post-pump frame step
+        case 0x167420u: // frame-loop step
+        case 0x1987b0u: // frame-loop step
+        case 0x161500u: // boot sm caller 2
+        case 0x1544f8u: // post task
+        case 0x154518u: // task launcher
+        case 0x175928u: // TEMP flow callee
+        case 0x177bc8u: // TEMP teardown callee
+        case 0x1696a0u: // TEMP teardown callee
+        case 0x186250u: // TEMP teardown callee
+        case 0x186290u: // TEMP teardown caller
+        case 0x100de0u: // TEMP flow state
+        case 0x100e30u: // TEMP flow state
+        case 0x101008u: // TEMP flow state
+        case 0x13d900u: // TEMP queue node
+        case 0x13d960u: // TEMP queue node
+        case 0x13d9b8u: // TEMP queue completion
+        case 0x14d400u: // TEMP producer caller
+        case 0x14d4a8u: // TEMP producer caller
+        case 0x14d4b8u: // TEMP producer caller
+        case 0x14d4f0u: // TEMP producer caller
+        case 0x14d49cu: // TEMP producer caller
+        case 0x14d4acu: // TEMP producer caller
+        case 0x152d50u: // TEMP producer caller
+        case 0x1088f0u: // TEMP producer caller
+        case 0x189f18u: // TEMP pad poller caller
+        case 0x189d58u: // TEMP pad area reader
+        case 0x189fc0u: // TEMP pad reader
+        case 0x17f538u: // TEMP UI tick
+        case 0x167450u: // TEMP UI tick caller
+        case 0x1673b8u: // TEMP pump ticker
+        case 0x1674c0u: // TEMP walker caller?
+        case 0x17f278u: // TEMP task slot installer
+        case 0x17f000u: // TEMP task installer
+        case 0x18f0e0u: // TEMP installed task handler
+        {
+            auto &count = m_bootWatchCounts[targetPc];
+            ++count;
+            if (count <= 3u)
+            {
+                std::cerr << "[probe:call] target=0x" << std::hex << targetPc
+                          << " from=0x" << sourcePc << " kind=" << debugName << std::dec
+                          << " n=" << count << std::endl;
+            }
+            break;
+        }
+        default:
+            if (kind != GuestBranchKind::DirectCall && kind != GuestBranchKind::DirectJump)
+            {
+                auto &count = m_bootWatchCounts[targetPc | 0x80000000u];
+                ++count;
+                auto &total = m_bootWatchCounts[0xDEADBEEFu];
+                if (count <= 2u && total < 120u)
+                {
+                    ++total;
+                    std::cerr << "[probe:indirect] target=0x" << std::hex << targetPc
+                              << " from=0x" << sourcePc << " kind=" << debugName << std::dec
+                              << " n=" << count << std::endl;
+                }
+            }
+            if (targetPc >= 0x165000u && targetPc < 0x167000u)
+            {
+                auto &count = m_bootWatchCounts[targetPc];
+                ++count;
+                if (count <= 3u)
+                {
+                    std::cerr << "[probe:state] target=0x" << std::hex << targetPc
+                              << " from=0x" << sourcePc << " kind=" << debugName << std::dec
+                              << " n=" << count << std::endl;
+                }
+            }
+            break;
+        }
+    }
 
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
-    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+    // A call must run to its callee so its return PC/stack continuation stays
+    // coherent.  The callee and the generated caller already expose regular
+    // safe points; interrupting here leaves the guest suspended at the call
+    // boundary and can repeatedly replay initialization side effects.  Keep
+    // the dispatch charge for non-call transfers, where there is no return
+    // continuation to preserve.
+    if (!isCall && m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
         return false;
     }
@@ -1335,6 +1652,17 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (!hasFunction(targetPc))
     {
+        // A null indirect call is a legal state for optional callbacks in
+        // retail middleware.  Treat it as an uninstalled callback and resume
+        // after the delay slot instead of transferring the EE thread to
+        // address zero, which otherwise strands the scheduler permanently.
+        if (targetPc == 0u && kind == GuestBranchKind::IndirectCall)
+        {
+            reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
+            ctx->pc = fallthroughPc;
+            return true;
+        }
+
         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
 
         const MissingFunctionPolicy policy = missingFunctionPolicy();
@@ -1356,7 +1684,752 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    if (targetPc == 0x1A96D8u || targetPc == 0x1A96A0u)
+    {
+        static uint32_t callbackStateProbeCount = 0u;
+        if (callbackStateProbeCount < 24u)
+        {
+            std::cerr << "[probe:callback-state] target=0x" << std::hex << targetPc
+                      << " source=0x" << sourcePc
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << " a3=0x" << getRegU32(ctx, 7)
+                      << " global49c460=0x" << Ps2FastRead32(rdram, 0x49C460u)
+                      << " global49c448=0x" << Ps2FastRead32(rdram, 0x49C448u)
+                      << " global4a9e4c=0x" << Ps2FastRead32(rdram, 0x4A9E4Cu)
+                      << std::dec << '\n';
+            ++callbackStateProbeCount;
+        }
+    }
+    if (targetPc == 0x175A18u || targetPc == 0x175B08u || targetPc == 0x175BF8u ||
+        targetPc == 0x175D78u || targetPc == 0x154578u || targetPc == 0x154518u)
+    {
+        static uint32_t taskApiProbeCount = 0u;
+        if (taskApiProbeCount < 96u)
+        {
+            std::cerr << "[probe:task-api] target=0x" << std::hex << targetPc
+                      << " source=0x" << sourcePc
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << " a3=0x" << getRegU32(ctx, 7)
+                      << " gate0=0x" << static_cast<unsigned>(rdram[0xF6D278u])
+                      << " gate1=0x" << static_cast<unsigned>(rdram[0xF6D279u])
+                      << " head=0x" << Ps2FastRead32(rdram, 0xF6D280u)
+                      << " slot0=";
+            for (uint32_t i = 0; i < 0x20u; i += 4u)
+                std::cerr << (i ? "," : "") << "0x" << Ps2FastRead32(rdram, 0xF6D280u + i);
+            std::cerr << std::dec << '\n';
+            ++taskApiProbeCount;
+        }
+    }
+    // Snapshot the generic boot/task object's callback gate before invoking a
+    // guest function.  Keep declarations above the diagnostic gotos below.
+    const uint32_t bootObjectProbe = Ps2FastRead32(rdram, 0x101BDD4u) & PS2_RAM_MASK;
+    const uint32_t bootStateCBefore = bootObjectProbe < PS2_RAM_SIZE
+                                          ? Ps2FastRead32(rdram, bootObjectProbe + 0x0Cu)
+                                          : 0u;
+    // Observe indirect task dispatch targets without touching generated code.
+    // These are the two generic task-list jump sites (17f07c/17f0c4); seeing
+    // the actual function pointer is more useful than assuming the boot task
+    // remains at 167800 after its state callback changes it.
+    if (sourcePc == 0x17F07Cu || sourcePc == 0x17F0C4u)
+    {
+        static uint32_t taskDispatchProbeCount = 0u;
+        if (taskDispatchProbeCount < 1024u)
+        {
+            const uint32_t state = Ps2FastRead32(rdram, 0x101BDD0u) & PS2_RAM_MASK;
+            std::cerr << "[probe:task-dispatch] source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " ra=0x" << getRegU32(ctx, 31)
+                      << " state=0x" << state
+                      << " state0=0x" << Ps2FastRead32(rdram, state + 0x00u)
+                      << " state4=0x" << Ps2FastRead32(rdram, state + 0x04u)
+                      << " state8=0x" << Ps2FastRead32(rdram, state + 0x08u)
+                      << " stateC=0x" << static_cast<unsigned>(rdram[(state + 0x0Cu) & PS2_RAM_MASK])
+                      << " state14=0x" << Ps2FastRead32(rdram, state + 0x14u)
+                      << " state10=0x" << Ps2FastRead32(rdram, state + 0x10u)
+                << " taskHead=0x" << Ps2FastRead32(rdram, 0x101BDD4u)
+                << " d0=0x" << Ps2FastRead32(rdram, 0x5611D0u)
+                << " busy=0x" << static_cast<unsigned>(rdram[0x101DB77u])
+                << " idx=0x" << static_cast<unsigned>(rdram[0x101BDDFu])
+                << " base=0x" << Ps2FastRead32(rdram, 0x101BDD8u)
+                << " slot80=0x" << Ps2FastRead32(rdram, (state + 0x80u) & PS2_RAM_MASK)
+                << " slot100=0x" << Ps2FastRead32(rdram, (state + 0x100u) & PS2_RAM_MASK)
+                << " cc=0x" << static_cast<unsigned>(rdram[0x5611CCu])
+                << " cursor=0x" << Ps2FastRead32(rdram, 0x5611D4u)
+                << " entry=0x" << Ps2FastRead32(rdram, (Ps2FastRead32(rdram, 0x5611D4u) + 8u) & PS2_RAM_MASK)
+                << " entry3=0x" << Ps2FastRead32(rdram, (Ps2FastRead32(rdram, 0x5611D4u) + 20u) & PS2_RAM_MASK)
+                << " phase=0x" << Ps2FastRead32(rdram, 0x5611C0u)
+                << " q31=0x" << static_cast<unsigned>(rdram[0x987831u])
+                << " ec0=0x" << Ps2FastRead32(rdram, 0x4A9EC0u)
+                << " db10=0x" << Ps2FastRead32(rdram, 0x54DB10u)
+                << " db14=0x" << Ps2FastRead32(rdram, 0x54DB14u)
+                      << std::dec << '\n';
+            ++taskDispatchProbeCount;
+        }
+    }
+    if (sourcePc == 0x167688u || sourcePc == 0x1676F8u || sourcePc == 0x16773Cu)
+    {
+        static uint32_t bootCallbackProbeCount = 0u;
+        if (bootCallbackProbeCount < 96u)
+        {
+            const uint32_t a0 = getRegU32(ctx, 4);
+            std::cerr << "[probe:boot-callback] source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc
+                      << " a0=0x" << a0
+                      << " word0=0x" << Ps2FastRead32(rdram, a0)
+                      << " word4=0x" << Ps2FastRead32(rdram, a0 + 4u)
+                      << " word8=0x" << Ps2FastRead32(rdram, a0 + 8u)
+                      << " g5611d4=0x" << Ps2FastRead32(rdram, 0x5611D4u)
+                      << " g5611dc=0x" << Ps2FastRead32(rdram, 0x5611DCu)
+                      << " g5611cc=0x" << static_cast<unsigned>(rdram[0x5611CCu])
+                      << std::dec << '\n';
+            ++bootCallbackProbeCount;
+        }
+    }
+    if (sourcePc >= 0x167600u && sourcePc < 0x167800u)
+    {
+        static uint32_t bootBodyDispatchProbeCount = 0u;
+        if (bootBodyDispatchProbeCount < 160u)
+        {
+            std::cerr << "[probe:boot-body-dispatch] source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc
+                      << " kind=" << debugName
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << " a3=0x" << getRegU32(ctx, 7)
+                      << " g5611c0=0x" << Ps2FastRead32(rdram, 0x5611C0u)
+                      << " g5611cc=0x" << static_cast<unsigned>(rdram[0x5611CCu])
+                      << " g5611d0=0x" << Ps2FastRead32(rdram, 0x5611D0u)
+                      << std::dec << '\n';
+            ++bootBodyDispatchProbeCount;
+        }
+    }
+    {
+        // Narrow nested-call watch for the remaining stream mutations.  The
+        // scheduler probe attributes changes to the enclosing callback; this
+        // boundary identifies the exact dispatched callee without instrumenting
+        // generated headers or rebuilding the translation output.
+        const bool streamWatchTarget = targetPc == 0x19F250u || targetPc == 0x19F610u ||
+                                       targetPc == 0x1A2818u || targetPc == 0x1A8828u ||
+                                       targetPc == 0x1A8878u;
+        if (streamWatchTarget)
+        {
+            static bool streamWatchArmed = false;
+            static uint64_t streamWatchHash = 0u;
+            const uint32_t streamBase = 0x1F0D080u;
+            if (!streamWatchArmed && m_memory.getRDRAM()[0x1FCD080u] == 0x44u &&
+                m_memory.getRDRAM()[0x1FCD081u] == 0x3Du && m_memory.getRDRAM()[0x1FCD082u] == 0x40u &&
+                m_memory.getRDRAM()[0x1FCD083u] == 0x01u)
+            {
+                streamWatchArmed = true;
+                streamWatchHash = 1469598103934665603ull;
+                for (uint32_t i = 0u; i < 0x20000u; ++i)
+                {
+                    streamWatchHash ^= m_memory.getRDRAM()[streamBase + i];
+                    streamWatchHash *= 1099511628211ull;
+                }
+            }
+            if (streamWatchArmed)
+            {
+                targetFn(rdram, ctx, this);
+                // The stream watch is diagnostic; hashing 128 KiB after every
+                // nested call can cost more than the guest work itself. Keep
+                // the call transparent and sample the payload sparsely.
+                static uint32_t streamWatchSampleCounter = 0u;
+                if ((streamWatchSampleCounter++ & 0xFFu) != 0u)
+                {
+                    goto dispatchGuestBranchAfterTarget;
+                }
+                uint64_t currentHash = 1469598103934665603ull;
+                for (uint32_t i = 0u; i < 0x20000u; ++i)
+                {
+                    currentHash ^= m_memory.getRDRAM()[streamBase + i];
+                    currentHash *= 1099511628211ull;
+                }
+                if (currentHash != streamWatchHash)
+                {
+                    std::cerr << "[probe:stream-nested-change] target=0x" << std::hex << targetPc
+                              << " source=0x" << sourcePc << " old=0x" << streamWatchHash
+                              << " new=0x" << currentHash << std::dec << '\n';
+                    streamWatchHash = currentHash;
+                }
+                goto dispatchGuestBranchAfterTarget;
+            }
+        }
+    }
+#if PS2_TRACE_CALL_WATCH
+    if (targetPc == 0x180540u || targetPc == 0x167D70u || targetPc == 0x1007E8u ||
+        targetPc == 0x1665F0u || targetPc == 0x166890u || targetPc == 0x180588u ||
+        targetPc == 0x1A0740u || targetPc == 0x185BA0u || targetPc == 0x185A30u ||
+        targetPc == 0x1A2F30u || targetPc == 0x1A2D50u || targetPc == 0x1A2770u || targetPc == 0x1A3130u ||
+        targetPc == 0x18D020u || targetPc == 0x187F10u || targetPc == 0x187F98u ||
+        targetPc == 0x1675B8u || targetPc == 0x167800u || targetPc == 0x167908u ||
+        targetPc == 0x16CE20u || targetPc == 0x17F0A8u ||
+        targetPc == 0x188010u || targetPc == 0x19A958u || targetPc == 0x1A2818u ||
+        targetPc == 0x186708u || targetPc == 0x1A8828u ||
+        targetPc == 0x185E60u || targetPc == 0x185DE0u || targetPc == 0x185F80u ||
+        targetPc == 0x180708u || targetPc == 0x181058u || targetPc == 0x186438u ||
+        targetPc == 0x1862A8u || targetPc == 0x185C68u || targetPc == 0x180540u ||
+        targetPc == 0x1808E0u || targetPc == 0x180F68u ||
+        targetPc == 0x167998u || targetPc == 0x1679F8u || targetPc == 0x1679ECu ||
+        targetPc == 0x167968u || targetPc == 0x100DA0u || targetPc == 0x100978u ||
+        targetPc == 0x167BD8u ||
+        targetPc == 0x175A18u || targetPc == 0x175D78u || targetPc == 0x1544F8u ||
+        targetPc == 0x154518u || targetPc == 0x154578u ||
+        targetPc == 0x149F48u || targetPc == 0x101AF0u || targetPc == 0x167A20u ||
+        targetPc == 0x167A14u)
+    {
+        std::cerr << "[probe:call-watch] target=0x" << std::hex << targetPc
+                  << " before source=0x" << sourcePc
+                  << " fallthrough=0x" << fallthroughPc << " ra=0x" << getRegU32(ctx, 31)
+                  << " sp=0x" << getRegU32(ctx, 29)
+                  << " a0=0x" << getRegU32(ctx, 4)
+                  << " a1=0x" << getRegU32(ctx, 5)
+                  << " a2=0x" << getRegU32(ctx, 6)
+                  << " a3=0x" << getRegU32(ctx, 7)
+                  << " s0=0x" << getRegU32(ctx, 16)
+                  << " s0c=0x" << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 16) + 0xCu)
+                  << " a1c=0x" << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 5) + 0xCu)
+                  << " gpstate=0x" << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 28) - 0x7F28u)
+                  << " dvdBuf=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D418u)
+                  << " streamGlobal=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x4A9E4Cu)
+                  << " slot=0x" << Ps2FastRead64(m_memory.getRDRAM(), getRegU32(ctx, 29))
+                  << ((targetPc == 0x1862A8u)
+                          ? (std::string(" desc78=0x") + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead64(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0x78u); return s.str(); }() +
+                             " desc7c=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0x7Cu); return s.str(); }() +
+                             " desc84=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0x84u); return s.str(); }() +
+                             " desc98=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0x98u); return s.str(); }())
+                          : std::string())
+                  << std::dec << std::endl;
+    }
+#endif
+    if (targetPc == 0x186708u || targetPc == 0x187F98u || targetPc == 0x188010u ||
+        targetPc == 0x1A8828u || targetPc == 0x1A8878u)
+    {
+        std::cerr << "[probe:decoder-call] target=0x" << std::hex << targetPc
+                  << " before pc=0x" << ctx->pc << " ra=0x" << getRegU32(ctx, 31)
+                  << " a0=0x" << getRegU32(ctx, 4) << " a1=0x" << getRegU32(ctx, 5)
+                  << " a2=0x" << getRegU32(ctx, 6) << " a3=0x" << getRegU32(ctx, 7)
+                  << " qwords=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D450u)
+                  << " gpstate=0x" << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 28) - 0x7F28u)
+                  << " ctl10=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D390u)
+                  << " ctl84=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D404u)
+                  << " ctl88=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D408u)
+                  << " ctl90=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D410u)
+                  << " ctlA8=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D428u])
+                  << " ctlA9=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D429u])
+                  << " ctlAF=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D42Fu])
+                  << " state84=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D404u)
+                  << " state88=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D408u)
+                  << " state8c=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D40Cu)
+                  << " state94=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D414u)
+                  << " state98=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D418u)
+                  << " statea0=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D420u)
+                  << " statea4=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D424u)
+                  << " stateac=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D42Cu])
+                  << " statead=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D42Du])
+                  << " stateaf=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D42Fu])
+                  << " stateb0=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D430u)
+                  << " global1e=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D45Eu])
+                  << " report10=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D510u)
+                  << " report24=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D524u)
+                  << " report28=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D528u)
+                  << ((targetPc == 0x186708u)
+                          ? (std::string(" desc78=0x") + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead64(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0x78u); return s.str(); }() +
+                             " desc84=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0x84u); return s.str(); }() +
+                             " desc88=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0x88u); return s.str(); }() +
+                             " desc90=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0x90u); return s.str(); }() +
+                             " desc98=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0x98u); return s.str(); }() +
+                             " descA0=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0xA0u); return s.str(); }() +
+                             " descA4=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0xA4u); return s.str(); }() +
+                             " descA8=0x" + [&]() { std::ostringstream s; s << std::hex << static_cast<unsigned>(m_memory.getRDRAM()[getRegU32(ctx, 4) + 0xA8u]); return s.str(); }() +
+                             " descA9=0x" + [&]() { std::ostringstream s; s << std::hex << static_cast<unsigned>(m_memory.getRDRAM()[getRegU32(ctx, 4) + 0xA9u]); return s.str(); }() +
+                             " descAA=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead16(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0xAAu); return s.str(); }() +
+                             " descAC=0x" + [&]() { std::ostringstream s; s << std::hex << static_cast<unsigned>(m_memory.getRDRAM()[getRegU32(ctx, 4) + 0xACu]); return s.str(); }() +
+                             " descAD=0x" + [&]() { std::ostringstream s; s << std::hex << static_cast<unsigned>(m_memory.getRDRAM()[getRegU32(ctx, 4) + 0xADu]); return s.str(); }() +
+                             " descAF=0x" + [&]() { std::ostringstream s; s << std::hex << static_cast<unsigned>(m_memory.getRDRAM()[getRegU32(ctx, 4) + 0xAFu]); return s.str(); }() +
+                             " descB0=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0xB0u); return s.str(); }() +
+                             " global10=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), 0x101D390u); return s.str(); }() +
+                             " globalAC=0x" + [&]() { std::ostringstream s; s << std::hex << static_cast<unsigned>(m_memory.getRDRAM()[0x101D42Cu]); return s.str(); }())
+                          : std::string())
+                  << ((targetPc == 0x188010u)
+                          ? (std::string(" decState10=0x") + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), 0x101D450u); return s.str(); }() +
+                             " decState14=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), 0x101D454u); return s.str(); }() +
+                             " decState18=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), 0x101D458u); return s.str(); }() +
+                             " decState1c=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead16(m_memory.getRDRAM(), 0x101D45Cu); return s.str(); }())
+                          : std::string())
+                  << std::dec << '\n';
+    }
+    if (targetPc == 0x1A2818u)
+    {
+        static uint32_t sifStateCallProbe = 0u;
+        if (sifStateCallProbe < 64u)
+        {
+            const uint32_t a0 = getRegU32(ctx, 4);
+            std::cerr << "[probe:sif-state-call] a0=0x" << std::hex << a0
+                      << " ra=0x" << getRegU32(ctx, 31)
+                      << " source=0x" << sourcePc;
+            if (a0 >= 0x1E4D080u && a0 < 0x1FEE7F0u)
+            {
+                std::cerr << " OVERLAPS_STREAM";
+            }
+            std::cerr << std::dec << '\n';
+            ++sifStateCallProbe;
+        }
+    }
+    // Temporary async-I/O task probe. These entries are reached through the
+    // guest task dispatcher rather than the decoder's direct call chain; keep
+    // this outside PS2_TRACE_CALL_WATCH so the scheduler path is observable in
+    // the normal diagnostic build.
+    if (targetPc == 0x185E60u || targetPc == 0x185DE0u || targetPc == 0x185F80u)
+    {
+        static uint32_t asyncTaskProbeCount = 0u;
+        if (asyncTaskProbeCount < 96u)
+        {
+            std::cerr << "[probe:async-task] target=0x" << std::hex << targetPc
+                      << " source=0x" << sourcePc << " fallthrough=0x" << fallthroughPc
+                      << " ra=0x" << getRegU32(ctx, 31)
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << " ac=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D42Cu])
+                      << " state10=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D390u)
+                      << " state14=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D394u)
+                      << " state15=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D395u])
+                      << " state84=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D404u)
+                      << " state90=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D410u)
+                      << std::dec << '\n';
+            ++asyncTaskProbeCount;
+        }
+    }
+    if (targetPc == 0x1675F8u || targetPc == 0x167620u || targetPc == 0x167800u || targetPc == 0x167908u ||
+        targetPc == 0x167A20u || targetPc == 0x167968u || targetPc == 0x16CE20u ||
+        targetPc == 0x1038140u || targetPc == 0x10381A0u)
+    {
+        static uint32_t bootTaskProbeCount = 0u;
+        if (bootTaskProbeCount < 48u)
+        {
+            const uint32_t state = Ps2FastRead32(rdram, 0x101BDD0u) & PS2_RAM_MASK;
+            std::cerr << "[probe:boot-task] target=0x" << std::hex << targetPc
+                      << " state=0x" << state
+                      << " state0=0x" << Ps2FastRead32(rdram, state + 0x00u)
+                      << " state4=0x" << Ps2FastRead32(rdram, state + 0x04u)
+                      << " state8=0x" << Ps2FastRead32(rdram, state + 0x08u)
+                      << " stateC=0x" << static_cast<unsigned>(rdram[(state + 0x0Cu) & PS2_RAM_MASK])
+                      << " state14=0x" << Ps2FastRead32(rdram, state + 0x14u)
+                      << " state10=0x" << Ps2FastRead32(rdram, state + 0x10u)
+                      << " busy=0x" << static_cast<unsigned>(rdram[0x101DB77u])
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " ra=0x" << getRegU32(ctx, 31) << std::dec << '\n';
+            ++bootTaskProbeCount;
+        }
+    }
+    // Attribute task-object mutations to the dispatched guest function without
+    // instrumenting generated output.  The boot object is initialized once at
+    // 0x54dac0; its +0x0c callback/state gate must become non-zero before the
+    // generic task dispatcher can invoke registered work.  Sampling at call
+    // boundaries keeps this diagnostic cheap and applies to every title.
     targetFn(rdram, ctx, this);
+    if (targetPc == 0x175A18u)
+    {
+        static uint32_t taskWalkerAfterProbeCount = 0u;
+        if (taskWalkerAfterProbeCount < 96u)
+        {
+            const uint32_t taskBase = 0xF6D280u;
+            std::cerr << "[probe:task-walker-after] v0=0x" << std::hex << getRegU32(ctx, 2)
+                      << " pc=0x" << ctx->pc
+                      << " gate0=0x" << static_cast<unsigned>(rdram[0xF6D278u])
+                      << " gate1=0x" << static_cast<unsigned>(rdram[0xF6D279u])
+                      << " head=0x" << Ps2FastRead32(rdram, taskBase)
+                      << " next=0x" << Ps2FastRead32(rdram, taskBase + 4u)
+                      << " cb10=0x" << Ps2FastRead32(rdram, taskBase + 0x10u)
+                      << " cb14=0x" << Ps2FastRead32(rdram, taskBase + 0x14u)
+                      << " next20=0x" << Ps2FastRead32(rdram, taskBase + 0x20u)
+                      << std::dec << '\n';
+            ++taskWalkerAfterProbeCount;
+        }
+    }
+    if (targetPc == 0x1675F8u || targetPc == 0x167620u || targetPc == 0x167800u)
+    {
+        static uint32_t taskChainProbeCount = 0u;
+        if (taskChainProbeCount < 48u)
+        {
+            const uint32_t head = Ps2FastRead32(rdram, 0x101BDD0u) & PS2_RAM_MASK;
+            const uint32_t cb = head < PS2_RAM_SIZE ? Ps2FastRead32(rdram, head + 0x00u) : 0u;
+            const uint32_t next = head < PS2_RAM_SIZE ? Ps2FastRead32(rdram, head + 0x04u) : 0u;
+            std::cerr << "[probe:task-chain] target=0x" << std::hex << targetPc
+                      << " head=0x" << head
+                      << " cb=0x" << cb << " next=0x" << next
+                      << " arg=0x" << (head < PS2_RAM_SIZE ? Ps2FastRead32(rdram, head + 0x08u) : 0u)
+                      << " flags=0x" << (head < PS2_RAM_SIZE ? Ps2FastRead32(rdram, head + 0x0Cu) : 0u)
+                      << " state10=0x" << (head < PS2_RAM_SIZE ? Ps2FastRead32(rdram, head + 0x10u) : 0u)
+                      << " state14=0x" << (head < PS2_RAM_SIZE ? Ps2FastRead32(rdram, head + 0x14u) : 0u)
+                      << " pc=0x" << ctx->pc << std::dec << '\n';
+            ++taskChainProbeCount;
+        }
+    }
+    if (targetPc == 0x167908u)
+    {
+        static uint32_t splitContinuationProbeCount = 0u;
+        if (splitContinuationProbeCount < 8u)
+        {
+            std::cerr << "[probe:split-continuation] after=0x" << std::hex << ctx->pc
+                        << " fallthrough=0x" << fallthroughPc
+                        << " has=0x" << (hasFunction(ctx->pc) ? 1u : 0u)
+                        << " kind=" << debugName << std::dec << '\n';
+            ++splitContinuationProbeCount;
+        }
+    }
+    // THROWAWAY-DIAGNOSTIC: dedicated counters for the boot-gate path
+    // (shared cap would hide these rare calls behind the frame ticker).
+    if (targetPc == 0x100EB0u || targetPc == 0x103640u || targetPc == 0x103578u ||
+        targetPc == 0x167968u || targetPc == 0x167BE8u || targetPc == 0x167C08u ||
+        targetPc == 0x102C20u || targetPc == 0x1031E0u || targetPc == 0x103538u ||
+        targetPc == 0x1A2F30u || targetPc == 0x1A2D50u)
+    {
+        static uint32_t bootGatePathProbeCount = 0u;
+        if (bootGatePathProbeCount < 500u)
+        {
+            std::cerr << "[probe:boot-gate-path] target=0x" << std::hex << targetPc
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << " a3=0x" << getRegU32(ctx, 7)
+                      << " ra=0x" << getRegU32(ctx, 31)
+                      << " g561188=0x" << static_cast<unsigned>(rdram[0x561188u])
+                      << " g56118a=0x" << static_cast<unsigned>(rdram[0x56118Au])
+                      << " g56119d=0x" << static_cast<unsigned>(rdram[0x56119Du])
+                      << " cc=0x" << static_cast<unsigned>(rdram[0x5611CCu])
+                      << " b736b08=0x" << static_cast<unsigned>(rdram[0x736B08u])
+                      << std::dec << '\n';
+            ++bootGatePathProbeCount;
+        }
+    }
+    if (bootObjectProbe < PS2_RAM_SIZE)
+    {
+        const uint32_t bootStateCAfter = Ps2FastRead32(rdram, bootObjectProbe + 0x0Cu);
+        if (bootStateCAfter != bootStateCBefore)
+        {
+            static uint32_t bootStateMutationProbeCount = 0u;
+            if (bootStateMutationProbeCount < 96u)
+            {
+                std::cerr << "[probe:boot-state-mutation] target=0x" << std::hex << targetPc
+                          << " source=0x" << sourcePc
+                          << " object=0x" << bootObjectProbe
+                          << " before=0x" << bootStateCBefore
+                          << " after=0x" << bootStateCAfter
+                          << " pc=0x" << ctx->pc
+                          << " ra=0x" << getRegU32(ctx, 31)
+                          << std::dec << '\n';
+                ++bootStateMutationProbeCount;
+            }
+        }
+    }
+
+    // Some stripped/retail images expose an address-taken entry in the
+    // middle of a linear routine.  The generated slice can legitimately end
+    // at the next registered block without a JR $ra; on hardware execution
+    // simply falls through into that block.  This can happen for direct calls
+    // as well as indirect calls when an address-taken entry split the source
+    // routine.  Continue only when the next PC resolves to a *different*
+    // registered function; a normal return lands exactly at fallthroughPc and
+    // is therefore left to the caller's generated continuation.
+    for (unsigned continuationDepth = 0u;
+         (kind == GuestBranchKind::IndirectCall || kind == GuestBranchKind::DirectCall) &&
+             continuationDepth < 16u;
+         ++continuationDepth)
+    {
+        const uint32_t continuationPc = ctx->pc;
+        if (continuationPc == fallthroughPc || continuationPc <= targetPc || !hasFunction(continuationPc))
+        {
+            break;
+        }
+
+        const RecompiledFunction continuationFn = lookupFunction(continuationPc);
+        if (targetPc == 0x167908u)
+        {
+            static uint32_t splitContinuationInvokeProbeCount = 0u;
+            if (splitContinuationInvokeProbeCount < 8u)
+            {
+                std::cerr << "[probe:split-continuation-invoke] pc=0x" << std::hex
+                          << continuationPc << " same=0x" << (continuationFn == targetFn ? 1u : 0u)
+                          << std::dec << '\n';
+                ++splitContinuationInvokeProbeCount;
+            }
+        }
+        if (continuationFn == targetFn)
+        {
+            break;
+        }
+
+        continuationFn(rdram, ctx, this);
+        if (targetPc == 0x167908u)
+        {
+            static uint32_t splitContinuationResultProbeCount = 0u;
+            if (splitContinuationResultProbeCount < 8u)
+            {
+                std::cerr << "[probe:split-continuation-result] pc=0x" << std::hex
+                          << ctx->pc << " g5611cc=0x" << static_cast<unsigned>(rdram[0x5611CCu])
+                          << std::dec << '\n';
+                ++splitContinuationResultProbeCount;
+            }
+        }
+    }
+dispatchGuestBranchAfterTarget:
+    if (targetPc == 0x1675F8u || targetPc == 0x167620u || targetPc == 0x167800u || targetPc == 0x167908u ||
+        targetPc == 0x167A20u || targetPc == 0x167968u || targetPc == 0x16CE20u ||
+        targetPc == 0x1038140u || targetPc == 0x10381A0u ||
+        targetPc == 0x100EB0u || targetPc == 0x103640u || targetPc == 0x103578u ||
+        targetPc == 0x167BD8u || targetPc == 0x167D68u)
+    {
+        static uint32_t bootTaskAfterProbeCount = 0u;
+        if (bootTaskAfterProbeCount < 48u)
+        {
+            const uint32_t state = Ps2FastRead32(rdram, 0x101BDD0u) & PS2_RAM_MASK;
+            std::cerr << "[probe:boot-task-after] target=0x" << std::hex << targetPc
+                      << " state=0x" << state
+                      << " state14=0x" << Ps2FastRead32(rdram, state + 0x14u)
+                      << " state10=0x" << Ps2FastRead32(rdram, state + 0x10u)
+                      << " busy=0x" << static_cast<unsigned>(rdram[0x101DB77u])
+                      << " v0=0x" << getRegU32(ctx, 2)
+                      << " g5611c0=0x" << Ps2FastRead32(rdram, 0x5611C0u)
+                      << " g5611cc=0x" << static_cast<unsigned>(rdram[0x5611CCu])
+                      << " g5611d0=0x" << Ps2FastRead32(rdram, 0x5611D0u)
+                      << " g5611d4=0x" << Ps2FastRead32(rdram, 0x5611D4u)
+                      << " g5611e0=0x" << Ps2FastRead32(rdram, 0x5611E0u)
+                      << " g5611e4=0x" << Ps2FastRead32(rdram, 0x5611E4u)
+                      << " g5611e8=0x" << Ps2FastRead32(rdram, 0x5611E8u)
+                      << " g5611ec=0x" << Ps2FastRead32(rdram, 0x5611ECu)
+                      << " g5611dc=0x" << Ps2FastRead32(rdram, 0x5611DCu)
+                      << " tbl27b380=0x" << Ps2FastRead32(rdram, 0x27B380u)
+                      << " tbl27b390=0x" << Ps2FastRead32(rdram, 0x27B390u)
+                      << " tbl27b398=0x" << Ps2FastRead32(rdram, 0x27B398u)
+                      << " tbl27b39c=0x" << Ps2FastRead32(rdram, 0x27B39Cu)
+                      << " tbl27b3a0=0x" << Ps2FastRead32(rdram, 0x27B3A0u)
+                      << " bootFlag=0x" << static_cast<unsigned>(rdram[0x101D42Du])
+                      << " sysBasePtr=0x" << Ps2FastRead32(rdram, 0x4A9E58u)
+                      << " sys14dyn=0x" << static_cast<unsigned>(rdram[(Ps2FastRead32(rdram, 0x4A9E58u) + 0x14u) & PS2_RAM_MASK])
+                      << " sys10dyn=0x" << Ps2FastRead32(rdram, (Ps2FastRead32(rdram, 0x4A9E58u) + 0x10u) & PS2_RAM_MASK)
+                      << " sys18dyn=0x" << Ps2FastRead32(rdram, (Ps2FastRead32(rdram, 0x4A9E58u) + 0x18u) & PS2_RAM_MASK)
+                      << " decAC=0x" << static_cast<unsigned>(rdram[0x101D42Cu])
+                      << " decAD=0x" << static_cast<unsigned>(rdram[0x101D42Du])
+                      << " decST=0x" << static_cast<unsigned>(rdram[0x101D45Eu])
+                      << " r0=0x" << ((uint64_t)(uint32_t)_mm_extract_epi32(ctx->r[0], 1) << 32 | (uint64_t)(uint32_t)_mm_extract_epi32(ctx->r[0], 0))
+                      << " decRemain=0x" << Ps2FastRead32(rdram, 0x101D448u)
+                      << " decOut=0x" << Ps2FastRead32(rdram, 0x101D44Cu)
+                      << " decSrc=0x" << Ps2FastRead32(rdram, 0x101D450u)
+                      << " decEnd=0x" << Ps2FastRead32(rdram, 0x101D454u)
+                      << " g561188=0x" << static_cast<unsigned>(rdram[0x561188u])
+                      << " g56118a=0x" << static_cast<unsigned>(rdram[0x56118Au])
+                      << " g56119d=0x" << static_cast<unsigned>(rdram[0x56119Du])
+                      << " b736b08=0x" << static_cast<unsigned>(rdram[0x736B08u])
+                      << std::dec << '\n';
+            ++bootTaskAfterProbeCount;
+        }
+    }
+#if PS2_TRACE_CALL_WATCH
+    if (targetPc == 0x180540u || targetPc == 0x167D70u || targetPc == 0x1007E8u ||
+        targetPc == 0x1665F0u || targetPc == 0x166890u || targetPc == 0x180588u ||
+        targetPc == 0x1A0740u || targetPc == 0x185BA0u || targetPc == 0x185A30u ||
+        targetPc == 0x1A2F30u || targetPc == 0x1A2D50u || targetPc == 0x1A2770u || targetPc == 0x1A3130u ||
+        targetPc == 0x18D020u || targetPc == 0x187F10u || targetPc == 0x187F98u ||
+        targetPc == 0x1675B8u || targetPc == 0x167800u || targetPc == 0x167908u ||
+        targetPc == 0x16CE20u || targetPc == 0x17F0A8u ||
+        targetPc == 0x188010u || targetPc == 0x19A958u || targetPc == 0x1A2818u ||
+        targetPc == 0x186708u || targetPc == 0x1A8828u ||
+        targetPc == 0x185E60u || targetPc == 0x185DE0u || targetPc == 0x185F80u ||
+        targetPc == 0x180708u || targetPc == 0x181058u || targetPc == 0x186438u ||
+        targetPc == 0x1862A8u || targetPc == 0x185C68u || targetPc == 0x180540u ||
+        targetPc == 0x1808E0u || targetPc == 0x180F68u)
+    {
+        std::cerr << "[probe:call-watch] target=0x" << std::hex << targetPc
+                  << " after pc=0x" << ctx->pc
+                  << " ra=0x" << getRegU32(ctx, 31) << " sp=0x" << getRegU32(ctx, 29)
+                  << " v0=0x" << getRegU32(ctx, 2)
+                  << " gpstate=0x" << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 28) - 0x7F28u)
+                  << " dvdBuf=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D418u)
+                  << " streamGlobal=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x4A9E4Cu)
+                  << " slot=0x" << Ps2FastRead64(m_memory.getRDRAM(), getRegU32(ctx, 29))
+                  << ((targetPc == 0x1862A8u)
+                          ? (std::string(" desc78=0x") + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead64(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0x78u); return s.str(); }() +
+                             " desc84=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0x84u); return s.str(); }() +
+                             " desc98=0x" + [&]() { std::ostringstream s; s << std::hex << Ps2FastRead32(m_memory.getRDRAM(), getRegU32(ctx, 4) + 0x98u); return s.str(); }())
+                          : std::string())
+                  << std::dec << std::endl;
+    }
+#endif
+    if (targetPc == 0x186708u || targetPc == 0x187F98u ||
+        targetPc == 0x1A8828u || targetPc == 0x1A8878u)
+    {
+        std::cerr << "[probe:decoder-call] target=0x" << std::hex << targetPc
+                  << " after pc=0x" << ctx->pc << " v0=0x" << getRegU32(ctx, 2)
+                  << " ra=0x" << getRegU32(ctx, 31)
+                  << " qwords=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D450u)
+                  << " ctl10=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D390u)
+                  << " ctl88=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D408u)
+                  << " ctl90=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D410u)
+                  << " ctlA8=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D428u])
+                  << " ctlA9=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D429u])
+                  << " ctlAF=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D42Fu])
+                  << " status=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D45Eu])
+                  << " cop0=0x" << ctx->cop0_status
+                  << std::dec << '\n';
+    }
+    if (targetPc == 0x187F98u)
+    {
+        static uint32_t decoderInputHashProbeCount = 0u;
+        if (decoderInputHashProbeCount++ < 4u)
+        {
+            const uint32_t input = getRegU32(ctx, 6);
+            const uint32_t inputBytes = Ps2FastRead32(m_memory.getRDRAM(), 0x101D40Cu);
+            uint64_t hash = 1469598103934665603ull;
+            for (uint32_t i = 0u; i < inputBytes; ++i)
+            {
+                hash ^= m_memory.getRDRAM()[input + i];
+                hash *= 1099511628211ull;
+            }
+            std::cerr << "[probe:decoder-input-hash] ptr=0x" << std::hex << input
+                      << " bytes=0x" << inputBytes << " fnv=0x" << hash << std::dec << '\n';
+            for (uint32_t segment = 0u; segment < inputBytes; segment += 0x20000u)
+            {
+                const uint32_t segmentBytes = std::min<uint32_t>(0x20000u, inputBytes - segment);
+                uint64_t segmentHash = 1469598103934665603ull;
+                for (uint32_t i = 0u; i < segmentBytes; ++i)
+                {
+                    segmentHash ^= m_memory.getRDRAM()[input + segment + i];
+                    segmentHash *= 1099511628211ull;
+                }
+                std::cerr << "[probe:decoder-input-segment] n=0x" << std::hex << (segment / 0x20000u)
+                          << " fnv=0x" << segmentHash << std::dec << '\n';
+            }
+        }
+        std::cerr << "[probe:decoder-state] cap=0x" << std::hex
+                  << Ps2FastRead32(m_memory.getRDRAM(), 0x101D448u)
+                  << " out=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D44Cu)
+                  << " qwords=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D450u)
+                  << " input=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D454u)
+                  << " base=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D458u)
+                  << " bits=0x" << Ps2FastRead16(m_memory.getRDRAM(), 0x101D45Cu)
+                  << " status=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D45Eu])
+                  << std::dec << '\n';
+    }
+    if (targetPc == 0x186708u)
+    {
+        static uint32_t decoderPumpStateProbeCount = 0u;
+        if (decoderPumpStateProbeCount++ < 96u)
+        {
+            std::cerr << "[probe:decoder-pump-state] state10=0x" << std::hex
+                      << Ps2FastRead32(m_memory.getRDRAM(), 0x101D450u)
+                      << " state14=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D454u)
+                      << " state18=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D458u)
+                      << " state1c=0x" << Ps2FastRead16(m_memory.getRDRAM(), 0x101D45Cu)
+                      << " state1e=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D45Eu])
+                      << " desc84=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D404u)
+                      << " desc88=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D408u)
+                      << " desc90=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x101D410u)
+                      << " desca9=0x" << static_cast<unsigned>(m_memory.getRDRAM()[0x101D429u])
+                      << std::dec << '\n';
+        }
+        // Throwaway decoder-output diagnostic: hash the decompressed output once
+        // the DVD producer goes idle after serving the FILE_02 stream. This is
+        // generic (reads guest RAM, no title address) and shows whether the
+        // custom decoder made progress before the boot wait.
+        {
+            const uint8_t ac = m_memory.getRDRAM()[0x101D42Cu];
+            const uint8_t ad = m_memory.getRDRAM()[0x101D42Du];
+            const uint32_t outBase = Ps2FastRead32(m_memory.getRDRAM(), 0x101D44Cu);
+            const uint32_t outCap = Ps2FastRead32(m_memory.getRDRAM(), 0x101D448u);
+            static bool outHashDone = false;
+            if (!outHashDone && ac == 0u && ad == 1u && outBase != 0u && outCap != 0u)
+            {
+                outHashDone = true;
+                uint64_t h = 1469598103934665603ull;
+                uint32_t nonZero = 0u;
+                const uint32_t bytes = std::min<uint32_t>(outCap, 0x22c7f4u);
+                for (uint32_t i = 0u; i < bytes; ++i)
+                {
+                    const uint8_t b = m_memory.getRDRAM()[outBase + i];
+                    if (b != 0u)
+                        ++nonZero;
+                    h ^= b;
+                    h *= 1099511628211ull;
+                }
+                std::cerr << "[probe:decoder-output] base=0x" << std::hex << outBase
+                          << " cap=0x" << outCap << " fnv=0x" << h
+                          << " nonzero=0x" << nonZero
+                          << " q987900=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x987900u)
+                          << " q987904=0x" << Ps2FastRead32(m_memory.getRDRAM(), 0x987904u) << " head=";
+                for (uint32_t i = 0u; i < 16u && i < bytes; ++i)
+                    std::cerr << static_cast<unsigned>(m_memory.getRDRAM()[outBase + i]) << ' ';
+                std::cerr << " tail=";
+                {
+                    uint32_t tailNonZero = 0u;
+                    uint64_t tailHash = 1469598103934665603ull;
+                    const uint32_t tailBytes = std::min<uint32_t>(0x1000u, bytes);
+                    for (uint32_t i = 0u; i < tailBytes; ++i)
+                    {
+                        const uint8_t b = m_memory.getRDRAM()[outBase + bytes - tailBytes + i];
+                        if (b != 0u)
+                            ++tailNonZero;
+                        tailHash ^= b;
+                        tailHash *= 1099511628211ull;
+                    }
+                    std::cerr << "nonzero=0x" << tailNonZero << " fnv=0x" << tailHash;
+                }
+                {
+                    uint32_t lastNonZero = 0u;
+                    for (uint32_t i = 0u; i < bytes; ++i)
+                    {
+                        if (m_memory.getRDRAM()[outBase + i] != 0u)
+                            lastNonZero = i;
+                    }
+                    std::cerr << " lastnz=0x" << lastNonZero;
+                }
+                std::cerr << std::dec << '\n';
+            }
+        }
+    }
+    if (targetPc == 0x1865E8u)
+    {
+        const uint32_t control = 0x0101D380u;
+        std::cerr << "[probe:decoder-pump] pc=0x" << std::hex << ctx->pc
+                  << " v0=0x" << getRegU32(ctx, 2)
+                  << " report10=0x" << Ps2FastRead32(m_memory.getRDRAM(), control + 0x10u)
+                  << " desc84=0x" << Ps2FastRead32(m_memory.getRDRAM(), control + 0x84u)
+                  << " desc88=0x" << Ps2FastRead32(m_memory.getRDRAM(), control + 0x88u)
+                  << " desc90=0x" << Ps2FastRead32(m_memory.getRDRAM(), control + 0x90u)
+                  << " stateac=0x" << static_cast<unsigned>(m_memory.getRDRAM()[control + 0xACu])
+                  << " statead=0x" << static_cast<unsigned>(m_memory.getRDRAM()[control + 0xADu])
+                  << std::dec << '\n';
+    }
+    if (targetPc == 0x185BF8u)
+    {
+        const uint32_t control = 0x0101D380u;
+        std::cerr << "[probe:filectrl-status] pc=0x" << std::hex << ctx->pc
+                  << " v0=0x" << getRegU32(ctx, 2)
+                  << " report10=0x" << Ps2FastRead32(m_memory.getRDRAM(), control + 0x10u)
+                  << " desc84=0x" << Ps2FastRead32(m_memory.getRDRAM(), control + 0x84u)
+                  << " desc88=0x" << Ps2FastRead32(m_memory.getRDRAM(), control + 0x88u)
+                  << " desc90=0x" << Ps2FastRead32(m_memory.getRDRAM(), control + 0x90u)
+                  << " stateac=0x" << static_cast<unsigned>(m_memory.getRDRAM()[control + 0xACu])
+                  << " statead=0x" << static_cast<unsigned>(m_memory.getRDRAM()[control + 0xADu])
+                  << std::dec << '\n';
+    }
+
+    // THROWAWAY-DIAGNOSTIC: identify the call which leaves the guest PC on
+    // the boot-state data pointer instead of its normal fallthrough/return.
+    if (ctx->pc == 0x54DAC0u)
+    {
+        std::cerr << "[probe:pc54dac0] target=0x" << std::hex << targetPc
+                  << " source=0x" << sourcePc << " fallthrough=0x" << fallthroughPc
+                  << " kind=" << debugName << " ra=0x" << getRegU32(ctx, 31)
+                  << " sp=0x" << getRegU32(ctx, 29) << std::dec << std::endl;
+    }
 
     if (isStopRequested() || ctx->pc == 0u)
     {
@@ -1949,26 +3022,62 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
         return 0u;
     }
 
+    // Callback frames are guest-visible memory and must participate in the
+    // same interval allocator as guest malloc.  The old top-of-RAM bump
+    // region could overlap an otherwise valid DMA destination supplied by the
+    // game (the callback stack was then writing into the compressed stream).
+    // Allocating from the tracked heap gives every runtime-owned guest range a
+    // single non-overlapping ownership model, independent of game layout.
+    {
+        std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+        ensureGuestHeapInitializedLocked();
+        const uint32_t base = allocateGuestBlockLocked(allocSize, normalizedAlignment);
+        if (base != 0u)
+        {
+            return base + allocSize - 0x10u;
+        }
+    }
+
+    // Preserve the legacy pool as a last-resort compatibility path for
+    // runtimes that deliberately configure an empty heap (some focused tests
+    // and minimal hosts do this).  Normal loaded games take the tracked path
+    // above, which is the one that prevents DMA/stack overlap.
     std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+    if (m_guestHeapSuggestedBase > (kGuestHeapDefaultBase + kGuestHeapSafetyPad))
+    {
+        // Loaded games with an empty configured heap still have a safe,
+        // unclaimed interval between the image end and the heap hard limit.
+        // Grow the callback pool upward through that interval so it cannot
+        // overlap game-owned data near the top of RAM.
+        uint32_t base = alignGuestHeapValue(m_asyncCallbackStackFloor, normalizedAlignment);
+        const uint32_t limit = std::min(m_asyncCallbackStackTop, PS2_RAM_SIZE);
+        const uint64_t end = static_cast<uint64_t>(base) + allocSize;
+        if (base < limit && end <= limit)
+        {
+            m_asyncCallbackStackFloor = static_cast<uint32_t>(end);
+            return static_cast<uint32_t>(end) - 0x10u;
+        }
+        return 0u;
+    }
+
+    // Minimal hosts without a loaded image retain the historical top-down
+    // pool as a compatibility fallback.
     uint32_t top = m_asyncCallbackStackTop;
     if (top > PS2_RAM_SIZE)
     {
         top = PS2_RAM_SIZE;
     }
     top &= ~(kGuestHeapDefaultAlignment - 1u);
-
     if (top <= allocSize)
     {
         return 0u;
     }
-
     uint32_t base = top - allocSize;
     base &= ~(normalizedAlignment - 1u);
     if (base < m_asyncCallbackStackFloor || base >= top)
     {
         return 0u;
     }
-
     m_asyncCallbackStackTop = base;
     return top - 0x10u;
 }
@@ -2040,6 +3149,23 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value)
 {
+    // Temporary post-load task probe: the boot task waits on its completion
+    // byte at state+0x0c (state is normally 0x54dac0). Keep this in the
+    // implementation so it does not perturb the generated headers.
+    const uint32_t physicalAddr = vaddr & PS2_RAM_MASK;
+    if ((physicalAddr == 0x54DACCu || physicalAddr == 0x5611CCu ||
+         (physicalAddr >= 0x101BDDCu && physicalAddr <= 0x101BDE4u)) &&
+        ctx != nullptr)
+    {
+        static std::atomic<uint32_t> taskCompletionWrites{0u};
+        if (taskCompletionWrites.fetch_add(1u, std::memory_order_relaxed) < 64u)
+        {
+            std::cerr << "[probe:task-completion-write] addr=0x" << std::hex << vaddr
+                      << " value=0x" << static_cast<unsigned>(value)
+                      << " pc=0x" << ctx->pc
+                      << " ra=0x" << getRegU32(ctx, 31) << std::dec << '\n';
+        }
+    }
     ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
     try
     {
@@ -2066,6 +3192,21 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
+    // TEMP-EXPERIMENT: watch boot-idx word writes. Revert.
+    {
+        const uint32_t physicalAddr = vaddr & PS2_RAM_MASK;
+        if ((physicalAddr == 0x101BDE0u) && ctx != nullptr)
+        {
+            static std::atomic<uint32_t> idxWrites{0u};
+            if (idxWrites.fetch_add(1u, std::memory_order_relaxed) < 32u)
+            {
+                std::cerr << "[probe:idx-write] addr=0x" << std::hex << vaddr
+                          << " value=0x" << value
+                          << " pc=0x" << ctx->pc
+                          << " ra=0x" << getRegU32(ctx, 31) << std::dec << '\n';
+            }
+        }
+    }
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
     try
     {
@@ -2171,7 +3312,24 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    // Generated backward edges call this helper for every small guest slice
+    // (normally 32 cycles).  Crossing the C++ scheduler boundary that often
+    // dominates long linear decoders, while the EE only needs scheduling
+    // decisions at instruction/event granularity.  Batch the accounting and
+    // event check into a short guest-time quantum; this preserves cycle order
+    // and keeps event latency bounded without changing guest code.
+    thread_local uint32_t accumulatedCycles = 0u;
+    // Keep long linear generated slices out of the scheduler hot path while
+    // retaining a sub-second guest-time upper bound for pending events.
+    constexpr uint32_t kCheckpointQuantum = 1u << 30;
+    accumulatedCycles += cycles;
+    if (accumulatedCycles < kCheckpointQuantum)
+    {
+        return false;
+    }
+    const uint32_t elapsed = accumulatedCycles;
+    accumulatedCycles = 0u;
+    return m_eeScheduler->checkpointDue(elapsed);
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
@@ -2301,6 +3459,14 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 
 void PS2Runtime::run()
 {
+    using ProbePcCount = std::pair<uint32_t, uint64_t>;
+    static constexpr struct
+    {
+        bool operator()(const ProbePcCount &l, const ProbePcCount &r) const
+        {
+            return l.second > r.second;
+        }
+    } ProbePcCountGreater{};
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
     resetIop();
@@ -2346,37 +3512,90 @@ void PS2Runtime::run()
         gameThreadFinished.store(true, std::memory_order_release); });
 
     uint64_t tick = 0;
+    uint64_t probeSample = 0;
+    std::map<uint32_t, uint64_t> probePcCounts;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
-            if ((tick % 120) == 0)
+            if (true)
             {
-                uint64_t curDma = m_memory.dmaStartCount();
-                uint64_t curGif = m_memory.gifCopyCount();
-                uint64_t curGs = m_memory.gsWriteCount();
-                uint64_t curVif = m_memory.vifWriteCount();
-                const GSRegisters &gs = m_memory.gs();
-                const uint32_t dbgPc = m_debugPc.load(std::memory_order_relaxed);
-                const uint32_t dbgRa = m_debugRa.load(std::memory_order_relaxed);
-                const uint32_t dbgSp = m_debugSp.load(std::memory_order_relaxed);
-                const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
                 const auto eeSnapshot = m_eeScheduler->snapshot();
 
-                RUNTIME_LOG("[run:tick] tick=" << tick
-                                               << " pc=0x" << std::hex << dbgPc
-                                               << " ra=0x" << dbgRa
-                                               << " sp=0x" << dbgSp
-                                               << " gp=0x" << dbgGp
-                                               << " dispfb1=0x" << gs.dispfb1
-                                               << " display1=0x" << gs.display1
-                                               << std::dec
-                                               << " activeThreads=" << eeSnapshot.threads.size()
-                                               << " dma=" << curDma
-                                               << " gif=" << curGif
-                                               << " gsw=" << curGs
-                                               << " vif=" << curVif
-                                               << std::endl);
+                for (const auto &probeThread : eeSnapshot.threads)
+                {
+                    // THROWAWAY-DIAGNOSTIC: account every thread so the boot
+                    // snapshot (probe:boot / probe:top) refreshes while the
+                    // game runs even when thread 1 is idle. Revert before
+                    // contribution.
+                    probePcCounts[probeThread.pc & ~0xFu]++;
+                    ++probeSample;
+                }
+                if ((probeSample % 60u) == 0u)
+                {
+                    const uint8_t *probeRdram = m_memory.getRDRAM();
+                    auto probeRead32 = [probeRdram](uint32_t address) -> uint32_t
+                    {
+                        if (!probeRdram || address >= PS2_RAM_SIZE)
+                        {
+                            return 0u;
+                        }
+                        uint32_t value = 0u;
+                        std::memcpy(&value, probeRdram + address, sizeof(value));
+                        return value;
+                    };
+                    // Throwaway boot diagnostics (removed before contribution).
+                    const uint32_t probeQueueCount = probeRead32(0x00987900u);
+                    const uint32_t probeFctrlState = probeRead32(0x0101D42Cu);
+                    const uint32_t probeTaskFlag = probeRead32(0x00F6D278u);
+                    const uint32_t probeTaskHead = probeRead32(0x00F6D280u);
+                    const uint32_t probeTaskTick0 = probeRead32(0x00F6D290u);
+                    const uint32_t probeTaskTick1 = probeRead32(0x00F6D2B0u);
+                    const uint32_t probeTaskTick2 = probeRead32(0x00F6D2D0u);
+                    const uint32_t probeSysPtrRaw = probeRead32(0x004A9E58u);
+                    const uint32_t probeSysPtr = probeSysPtrRaw & 0x1FFFFFFFu;
+                    uint32_t probeSys14 = 0u;
+                    uint32_t probeSys37 = 0u;
+                    uint32_t probeSnd37 = 0u;
+                    uint32_t probeBootState = 0u;
+                    const uint32_t probeSndPtrRaw = probeRead32(0x004A9E80u);
+                    const uint32_t probeSndPtr = probeSndPtrRaw & 0x1FFFFFFFu;
+                    if (probeSysPtr != 0u && probeSysPtr < PS2_RAM_SIZE - 0x40u)
+                    {
+                        probeSys14 = probeRead32(probeSysPtr + 0x14u) & 0xFFu;
+                        probeSys37 = (probeRead32(probeSysPtr + 0x34u) >> 24u) & 0xFFu;
+                    }
+                    if (probeSndPtr != 0u && probeSndPtr < PS2_RAM_SIZE - 0x40u)
+                    {
+                        probeSnd37 = (probeRead32(probeSndPtr + 0x34u) >> 24u) & 0xFFu;
+                    }
+                    const uint32_t probeSmBase = probeRead32(0x0101BDD0u) & 0x1FFFFFFFu;
+                    if (probeSmBase != 0u && probeSmBase < PS2_RAM_SIZE - 0x20u)
+                    {
+                        probeBootState = probeRead32(probeSmBase + 0x14u);
+                    }
+                    RUNTIME_LOG("[probe:boot] queue=" << probeQueueCount
+                              << " fctrlAcAd=" << std::hex << probeFctrlState
+                              << " bootState=" << probeBootState
+                              << " smBase=" << probeSmBase
+                              << " ticks=" << probeTaskTick0 << ","
+                              << probeTaskTick1 << "," << probeTaskTick2
+                              << " sysPtr=" << probeSysPtrRaw
+                              << " sys14=" << probeSys14
+                              << " sys37=" << probeSys37
+                              << " sndPtr=" << probeSndPtrRaw
+                              << " snd37=" << probeSnd37
+                              << std::dec << std::endl);
+                    std::vector<ProbePcCount> probeTop(probePcCounts.begin(), probePcCounts.end());
+                    std::sort(probeTop.begin(), probeTop.end(),
+                              ProbePcCountGreater);
+                    RUNTIME_LOG("[probe:top] samples=" << probeSample << std::endl);
+                    for (size_t i = 0; i < probeTop.size() && i < 12; ++i)
+                    {
+                        RUNTIME_LOG("[probe:top] pc=0x" << std::hex << probeTop[i].first
+                                  << " n=" << std::dec << probeTop[i].second << std::endl);
+                    }
+                }
             }
         });
         uint32_t presentWidth = FB_WIDTH;
@@ -2404,6 +3623,20 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+
+        // Host-driven pad autopoll: the real SIO2 refreshes pad buffers
+        // every vsync, but the emulated VBlank event does not fire for all
+        // games yet. Poll at display rate so the guest pad area never goes
+        // stale while the window loop runs.
+        {
+            static auto lastPoll = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastPoll >= std::chrono::milliseconds(16))
+            {
+                lastPoll = now;
+                notifyIopVBlank();
+            }
+        }
 
         if (WindowShouldClose())
         {
