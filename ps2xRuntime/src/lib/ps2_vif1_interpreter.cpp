@@ -33,18 +33,54 @@ namespace
 {
     constexpr uint8_t kGifFmtImage = 2u;
 
-    uint32_t gifImageQwcFromTag(const uint8_t *data, uint32_t sizeBytes)
+    uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
     {
         if (!data || sizeBytes < 16u)
             return 0u;
 
-        uint64_t tagLo = 0u;
-        std::memcpy(&tagLo, data, sizeof(tagLo));
-        const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
-        if (flg != kGifFmtImage)
-            return 0u;
+        uint32_t offset = 0u;
+        while (offset + 16u <= sizeBytes)
+        {
+            uint64_t tagLo = 0u;
+            std::memcpy(&tagLo, data + offset, sizeof(tagLo));
+            offset += 16u;
 
-        return static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
+            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+            if (nreg == 0u)
+                nreg = 16u;
+
+            uint64_t payloadBytes = 0u;
+            if (flg == 0u) // PACKED
+            {
+                payloadBytes = static_cast<uint64_t>(nloop) * nreg * 16ull;
+            }
+            else if (flg == 1u) // REGLIST, padded to a quadword
+            {
+                payloadBytes = static_cast<uint64_t>(nloop) * nreg * 8ull;
+                payloadBytes = (payloadBytes + 15ull) & ~15ull;
+            }
+            else if (flg == kGifFmtImage)
+            {
+                payloadBytes = static_cast<uint64_t>(nloop) * 16ull;
+                const uint64_t availableBytes = sizeBytes - offset;
+                if (payloadBytes > availableBytes)
+                {
+                    return static_cast<uint32_t>((payloadBytes - availableBytes) / 16ull);
+                }
+            }
+            else
+            {
+                return 0u;
+            }
+
+            if (payloadBytes > static_cast<uint64_t>(sizeBytes - offset))
+                return 0u;
+            offset += static_cast<uint32_t>(payloadBytes);
+        }
+
+        return 0u;
     }
 }
 
@@ -309,11 +345,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 (static_cast<uint64_t>(kGifFmtImage) << 58);
             std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
             std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2,
-                            imagePacket.data(),
-                            static_cast<uint32_t>(imagePacket.size()),
-                            false,
-                            m_vif1PendingPath2DirectHl);
+            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
 
             pos += chunkQw * 16u;
             m_vif1PendingPath2ImageQwc -= chunkQw;
@@ -482,8 +514,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_MPG)
         {
             uint32_t destAddr = (uint32_t)imm * 8u;
-            // VIF MPG semantics: NUM==0 means 256 instructions (2048 bytes).
-            // MPG payload is instruction-packed and should not be QW-aligned.
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
             if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
@@ -530,15 +560,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 // video VIF chains into an O(n²) sort/flush loop.
                 submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, false, directHl);
 
-                const uint32_t imageQw = gifImageQwcFromTag(data + pos, qwCount * 16u);
-                if (imageQw != 0u)
+                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
+                if (pendingImageQw != 0u)
                 {
-                    const uint32_t inlineImageQw = (qwCount > 0u) ? (qwCount - 1u) : 0u;
-                    if (imageQw > inlineImageQw)
-                    {
-                        m_vif1PendingPath2ImageQwc = imageQw - inlineImageQw;
-                        m_vif1PendingPath2DirectHl = directHl;
-                    }
+                    m_vif1PendingPath2ImageQwc = pendingImageQw;
+                    m_vif1PendingPath2DirectHl = directHl;
                 }
             }
 
