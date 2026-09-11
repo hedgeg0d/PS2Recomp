@@ -2,6 +2,9 @@
 #define PS2_RUNTIME_H
 
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <iostream>
 #include <cstdint>
 #include <vector>
 #include <string>
@@ -265,6 +268,35 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     // arrive through the uncached RAM mirror (0x20000000..0x3FFFFFFF) or kseg0,
     // so compare the physical address, not the raw virtual one.
     const uint32_t normAddr = guestAddr & 0x1FFFFFFFu;
+    // TEMP-EXPERIMENT: catch scalar/vector guest stores that overwrite the
+    // dynamic code overlay.  Helper/DMA paths have separate watchers; this
+    // covers generated WRITE* macros and identifies the exact guest PC.
+    if (std::getenv("PS2X_OVERLAY_TRACE") != nullptr &&
+        normAddr < 0x01038144u && normAddr + size > 0x01038140u && ctx != nullptr)
+    {
+        static std::atomic<uint32_t> s_overlayStoreWatch{0u};
+        if (s_overlayStoreWatch.fetch_add(1u, std::memory_order_relaxed) < 512u)
+        {
+            std::cerr << "[overlay-store] addr=0x" << std::hex << guestAddr
+                      << " norm=0x" << normAddr << " size=0x" << std::dec << size
+                      << " value=0x" << std::hex << valueLo
+                      << " pc=0x" << ctx->pc << " ra=0x" << getRegU32(ctx, 31)
+                      << " sp=0x" << getRegU32(ctx, 29) << std::dec << '\n';
+        }
+    }
+    // TEMP Katamari probe: the MC task controller lives at 0x101C9F0.
+    // Capture all stores to its small state block to identify who advances it.
+    if (normAddr >= 0x0101C9F0u && normAddr < 0x0101CA20u && ctx != nullptr)
+    {
+        static std::atomic<uint32_t> mcStateWrites{0u};
+        if (mcStateWrites.fetch_add(1u, std::memory_order_relaxed) < 256u)
+        {
+            std::cerr << "[probe:mc-state-write] addr=0x" << std::hex << normAddr
+                      << " size=" << std::dec << size << " value=0x" << std::hex << valueLo
+                      << " pc=0x" << ctx->pc << " ra=0x" << getRegU32(ctx, 31)
+                      << std::dec << std::endl;
+        }
+    }
     for (const uint32_t watched : kWatched)
     {
         const bool busyRange = (normAddr >= 0x0101D3B0u && normAddr < 0x0101D3C0u) ||
@@ -324,6 +356,20 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
     // helper rather than the scalar store helper. Keep the uncached mirror
     // visible while locating the subsystem busy-byte completion path.
     const uint32_t normAddr = guestAddr & 0x1FFFFFFFu;
+    // TEMP-EXPERIMENT: catch any helper-based overwrite of the dynamic code
+    // overlay. Revert after the writer is identified.
+    if (std::getenv("PS2X_OVERLAY_TRACE") != nullptr &&
+        normAddr < 0x01038200u && normAddr + size > 0x01038140u)
+    {
+        static std::atomic<uint32_t> s_overlayRangeWatch{0u};
+        if (s_overlayRangeWatch.fetch_add(1u, std::memory_order_relaxed) < 64u)
+        {
+            std::cerr << "[overlay-range-write] addr=0x" << std::hex << guestAddr
+                      << " norm=0x" << normAddr << " size=0x" << size
+                      << " op=" << (op ? op : "?")
+                      << " pc=0x" << (ctx ? ctx->pc : 0u) << std::dec << '\n';
+        }
+    }
     const bool touchesBusy = (normAddr < 0x0101DB80u &&
                               normAddr + size > 0x0101DB70u);
     if (touchesBusy)

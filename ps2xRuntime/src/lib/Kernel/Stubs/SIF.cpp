@@ -823,6 +823,19 @@ namespace ps2_stubs
 
             const ps2x::iop::RpcResult result =
                 PS2IopTransport::handleRpc(runtime, rdram, nullptr, request);
+            if (binding.sid == 0x80000400u && rpcNumber == 0x1u)
+            {
+                static uint32_t mcRpcProbeCount = 0u;
+                if (mcRpcProbeCount++ < 20u)
+                {
+                    uint32_t w0 = 0u;
+                    (void)readSifU32(rdram, receiveBuffer, w0);
+                    std::cerr << "[probe:mc-rpc-after] recv=0x" << std::hex << receiveBuffer
+                              << " size=0x" << receiveSize << " w0=0x" << w0
+                              << " resultAddr=0x" << result.resultAddress
+                              << std::dec << '\n';
+                }
+            }
             if (binding.sid == 0x00010000u && rpcNumber >= 2u && rpcNumber <= 6u)
             {
                 static uint32_t filectrlCompletionProbeCount = 0u;

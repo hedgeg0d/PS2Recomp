@@ -177,12 +177,12 @@ namespace ps2x::iop::detail
                     if (mcCount < 60)
                     {
                         ++mcCount;
-                        std::printf("[mcserv] n=%d fn=0x%x op=%d send=0x%x recv=0x%x\n",
+                        std::printf("[mcserv] n=%d fn=0x%x op=%d send=0x%x/%u recv=0x%x/%u\n",
                                     mcCount,
                                     request.function,
                                     static_cast<int>(operation),
-                                    request.send.address,
-                                    request.receive.address);
+                                    request.send.address, request.send.size,
+                                    request.receive.address, request.receive.size);
                         std::fflush(stdout);
                     }
                 }
@@ -218,6 +218,18 @@ namespace ps2x::iop::detail
                         request.send.size >= sizeof(parameter) &&
                         m_host.readGuest(request.send.address, &parameter, sizeof(parameter)))
                     {
+                        if (operation == Operation::GetInfo)
+                        {
+                            static int getInfoTrace = 0;
+                            if (getInfoTrace++ < 20)
+                            {
+                                std::printf("[mcserv] GetInfo fd=%d port=%d slot=%d size=%d off=%d origin=%d buf=0x%x param=0x%x\n",
+                                            parameter.fd, parameter.port, parameter.slot,
+                                            parameter.size, parameter.offset, parameter.origin,
+                                            parameter.buffer, parameter.parameter);
+                                std::fflush(stdout);
+                            }
+                        }
                         if (operation == Operation::Write && parameter.origin > 0 &&
                             parameter.origin <= static_cast<int32_t>(sizeof(parameter.data)))
                         {
@@ -288,8 +300,13 @@ namespace ps2x::iop::detail
                 {
                     return;
                 }
+                int32_t initResult = kSucceeded;
+                if (const char *overrideResult = std::getenv("PS2X_MCSERV_INIT_RESULT"))
+                {
+                    initResult = static_cast<int32_t>(std::strtol(overrideResult, nullptr, 0));
+                }
                 const std::array<uint32_t, 3> values = {
-                    static_cast<uint32_t>(kSucceeded), mcservVersion(), mcmanVersion()};
+                    static_cast<uint32_t>(initResult), mcservVersion(), mcmanVersion()};
                 const uint32_t bytes = std::min<uint32_t>(receive.size, sizeof(values));
                 (void)m_host.writeGuest(receive.address, values.data(), bytes);
                 if (receive.size > bytes)

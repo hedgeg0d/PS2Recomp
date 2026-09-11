@@ -1,0 +1,25 @@
+Katamari progress snapshot — 2026-09-11
+
+Tracked runtime changes in this commit, plus generated overlay sources and
+runner changes in the external backup archive.
+
+Verified milestone: with the command below, the game reaches and renders the
+Namco logo after the memory-card confirmation dialog. The run later stops on
+the next missing dynamic entry 0x177778.
+
+Build:
+  cd /home/hedgeg0d/Projects/qela/PS2Recomp
+  cmake --build out/build -j8
+  cmake --build /home/hedgeg0d/tools/katamari/runner/build -j8 --target ps2x_katamari
+
+Run used:
+  cd /home/hedgeg0d/tools/katamari/runner
+  timeout --signal=TERM --kill-after=5s 100s env PS2X_CODE_OVERLAY=1 PS2X_MCSERV_VER=210 PS2X_MCMAN_VER=226 PS2X_FORCE_MC_YES=1 PS2X_FORCE_MC_CONFIRM=1 PS2X_INPUT_TRACE=1 PS2X_PAD_SCRIPT='L40-40.1,X43-43.1,S80-81' ./build/ps2x_katamari /home/hedgeg0d/tools/katamari/SLUS_210.08
+
+Evidence:
+  /tmp/katamari/after-entry82d8-20260911.log
+  Namco/logo-era presentation had nonblack values 6104–7890; final blocker:
+  missing direct call target 0x177778 from 0x10386b8.
+
+External files are intentionally not in this repository commit. Restore them
+from /home/hedgeg0d/katamari-progress-20260911.tar.xz.

@@ -240,6 +240,16 @@ namespace ps2_stubs
                 return true;
             }
 
+            // TEMP-EXPERIMENT: CD reads bypass guest store helpers. Catch a
+            // disc read targeting the dynamic overlay range.
+            if (std::getenv("PS2X_OVERLAY_TRACE") != nullptr &&
+                offset < 0x01038200u && offset + bytes > 0x01038140u)
+            {
+                std::fprintf(stderr,
+                             "[overlay-cd-read] lbn=0x%x sectors=0x%x dst=0x%x bytes=0x%zx pc=0x%x\n",
+                             args.lbn, args.sectors, offset, bytes, ctx ? ctx->pc : 0u);
+            }
+
             return readCdSectors(args.lbn, args.sectors, rdram + offset, bytes);
         };
 
@@ -493,6 +503,14 @@ namespace ps2_stubs
             if (bytes > maxBytes)
             {
                 bytes = maxBytes;
+            }
+
+            if (std::getenv("PS2X_OVERLAY_TRACE") != nullptr &&
+                offset < 0x01038200u && offset + bytes > 0x01038140u)
+            {
+                std::fprintf(stderr,
+                             "[overlay-cd-chain] lbn=0x%x sectors=0x%x dst=0x%x bytes=0x%zx pc=0x%x\n",
+                             lbn, sectors, offset, bytes, ctx ? ctx->pc : 0u);
             }
 
             if (!readCdSectors(lbn, sectors, rdram + offset, bytes))
@@ -817,6 +835,13 @@ namespace ps2_stubs
 
                 const uint32_t readLbn = g_cdStreamingLbn;
                 const size_t readBytes = static_cast<size_t>(sectors) * kCdSectorSize;
+                if (std::getenv("PS2X_OVERLAY_TRACE") != nullptr &&
+                    offset < 0x01038200u && offset + readBytes > 0x01038140u)
+                {
+                    std::fprintf(stderr,
+                                 "[overlay-cd-stream] lbn=0x%x sectors=0x%x dst=0x%x bytes=0x%zx pc=0x%x\n",
+                                 readLbn, sectors, offset, readBytes, ctx ? ctx->pc : 0u);
+                }
                 if (!readCdSectors(readLbn, sectors, rdram + offset, readBytes))
                 {
                     finishCdStRead(rdram, ctx, state, g_lastCdError);

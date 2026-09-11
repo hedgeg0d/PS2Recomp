@@ -23,6 +23,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <chrono>
 #include <atomic>
@@ -1174,6 +1175,15 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 
     RecompiledFunction overlayFunction = nullptr;
     const bool overlayOwnsAddress = ps2x::resolveCodeOverlay(this, address, overlayFunction);
+    if (std::getenv("PS2X_OVERLAY_TRACE") != nullptr &&
+        (address == 0x1038140u || address == 0x1038238u || address == 0x1038248u ||
+         address == 0x1038250u))
+    {
+        static uint32_t overlayLookupTrace = 0u;
+        if (overlayLookupTrace++ < 48u)
+            std::fprintf(stderr, "[overlay-lookup] pc=0x%x owns=%d fn=%d\n",
+                         address, overlayOwnsAddress ? 1 : 0, overlayFunction ? 1 : 0);
+    }
     if (overlayFunction)
         return overlayFunction;
     uint32_t slot = 0u;
@@ -1414,6 +1424,38 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+
+    // Optional bounded diagnostic: hexadecimal guest PC range, START:END.
+    static const auto traceRange = [] {
+        std::pair<uint32_t, uint32_t> range{0u, 0u};
+        if (const char *value = std::getenv("PS2X_TRACE_CALL_RANGE"))
+        {
+            char *end = nullptr;
+            const unsigned long first = std::strtoul(value, &end, 16);
+            if (end != value && *end == ':')
+            {
+                const char *lastStart = end + 1;
+                const unsigned long last = std::strtoul(lastStart, &end, 16);
+                if (end != lastStart && *end == '\0' && first < last && last <= UINT32_MAX)
+                    range = {static_cast<uint32_t>(first), static_cast<uint32_t>(last)};
+            }
+        }
+        return range;
+    }();
+    if (isCall && targetPc >= traceRange.first && targetPc < traceRange.second)
+    {
+        static thread_local std::map<uint64_t, uint64_t> counts;
+        const uint64_t edge = (static_cast<uint64_t>(sourcePc) << 32u) | targetPc;
+        const uint64_t count = ++counts[edge];
+        if (count <= 3u || count % 600u == 0u)
+            std::cerr << "[guest-call-range] n=" << std::dec << count
+                      << " target=0x" << std::hex << targetPc
+                      << " source=0x" << sourcePc
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << std::dec << '\n';
+    }
 
     // Temporary guard for accidental guest stack placement over active DMA
     // buffers.  This catches nested calls that do not pass through the EE
@@ -2035,6 +2077,29 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // generic task dispatcher can invoke registered work.  Sampling at call
     // boundaries keeps this diagnostic cheap and applies to every title.
     targetFn(rdram, ctx, this);
+    if (targetPc == 0x18B7E0u)
+    {
+        static uint32_t mcInfoProbeCount = 0u;
+        if (mcInfoProbeCount++ < 12u)
+        {
+            const uint32_t a0 = getRegU32(ctx, 4);
+            std::cerr << "[probe:mc-info-after] a0=0x" << std::hex << a0
+                      << " a0[0]=0x" << Ps2FastRead32(rdram, a0)
+                      << " a0[4]=0x" << Ps2FastRead32(rdram, a0 + 4u)
+                      << " a0[0x90]=0x" << Ps2FastRead32(rdram, a0 + 0x90u)
+                      << " req0=0x" << Ps2FastRead32(rdram, 0x101ECC0u)
+                      << " req4=0x" << Ps2FastRead32(rdram, 0x101ECC4u)
+                      << " req90=0x" << Ps2FastRead32(rdram, 0x101ED50u)
+                      << " ptype=0x" << Ps2FastRead32(rdram, 0x101E7E8u)
+                      << "/0x" << Ps2FastRead32(rdram, Ps2FastRead32(rdram, 0x101E7E8u))
+                      << " pfree=0x" << Ps2FastRead32(rdram, 0x101E7ECu)
+                      << "/0x" << Ps2FastRead32(rdram, Ps2FastRead32(rdram, 0x101E7ECu))
+                      << " pformat=0x" << Ps2FastRead32(rdram, 0x101E7F0u)
+                      << "/0x" << Ps2FastRead32(rdram, Ps2FastRead32(rdram, 0x101E7F0u))
+                      << " reply=0x" << Ps2FastRead32(rdram, 0x101FD80u)
+                      << std::dec << '\n';
+        }
+    }
     if (targetPc == 0x175A18u)
     {
         static uint32_t taskWalkerAfterProbeCount = 0u;

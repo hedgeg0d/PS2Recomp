@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -15,6 +17,7 @@ namespace ps2x
         {
             const uint8_t *ram;
             std::vector<CodeOverlay> overlays;
+            bool activated = false;
         };
 
         struct Registry
@@ -61,7 +64,7 @@ namespace ps2x
         }
         auto &state = registry();
         std::lock_guard<std::mutex> lock(state.mutex);
-        state.runtimes.insert_or_assign(runtime, RuntimeOverlays{ram, std::move(overlays)});
+        state.runtimes.insert_or_assign(runtime, RuntimeOverlays{ram, std::move(overlays), false});
     }
 
     void clearCodeOverlays(const PS2Runtime *runtime)
@@ -84,14 +87,33 @@ namespace ps2x
         {
             if (pc < overlay.begin || pc >= overlay.end)
                 continue;
-            const bool sameCode = std::all_of(overlay.identity.begin(), overlay.identity.end(),
+            bool sameCode = std::all_of(overlay.identity.begin(), overlay.identity.end(),
                 [&](const OverlayWord &word)
                 {
                     const auto *p = found->second.ram + word.address;
                     const uint32_t actual = uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
                                             (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+                    if (actual != word.value && std::getenv("PS2X_OVERLAY_TRACE") != nullptr &&
+                        (pc == 0x1038140u || pc == 0x1038248u))
+                    {
+                        static uint32_t mismatchLog = 0u;
+                        if (mismatchLog++ < 16u)
+                            std::fprintf(stderr, "[overlay-mismatch] pc=0x%x word=0x%x expected=0x%x actual=0x%x\n",
+                                         pc, word.address, word.value, actual);
+                    }
                     return actual == word.value;
                 });
+            // TEMP test only: keep dispatching the compiled overlay after the
+            // guest reloads the original ELF bytes into the same address.
+            // This confirms whether the fallback ELF function is the blocker.
+            if (sameCode)
+                found->second.activated = true;
+            if (!sameCode && found->second.activated &&
+                std::getenv("PS2X_OVERLAY_STICKY") != nullptr &&
+                pc >= 0x1038140u && pc < 0x1264934u)
+            {
+                sameCode = true;
+            }
             if (!sameCode)
                 continue;
             if (matched)

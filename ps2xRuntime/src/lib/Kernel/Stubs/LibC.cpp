@@ -94,6 +94,18 @@ namespace ps2_stubs
         uint32_t size = getRegU32(ctx, 6);     // $a2
         size = sanitizeMemTransferSize(size, "memcpy");
 
+        // TEMP-EXPERIMENT: identify any guest memcpy that overwrites the
+        // dynamic Katamari overlay entry. Revert after the writer is known.
+        if (std::getenv("PS2X_OVERLAY_TRACE") != nullptr &&
+            destAddr < 0x1038200u && destAddr + size > 0x1038140u)
+        {
+            const uint8_t *src = getConstMemPtr(rdram, srcAddr);
+            std::fprintf(stderr, "[overlay-memcpy] dst=0x%08x src=0x%08x size=0x%x pc=0x%08x src0=0x%08x\n",
+                         destAddr, srcAddr, size, ctx->pc,
+                         src ? (uint32_t(src[0]) | (uint32_t(src[1]) << 8) |
+                                (uint32_t(src[2]) << 16) | (uint32_t(src[3]) << 24)) : 0u);
+        }
+
         uint32_t copied = 0u;
         uint32_t curDst = destAddr;
         uint32_t curSrc = srcAddr;

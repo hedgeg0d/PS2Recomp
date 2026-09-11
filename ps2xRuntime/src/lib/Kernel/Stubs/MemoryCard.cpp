@@ -883,6 +883,13 @@ namespace ps2_stubs
             setMcCommandResultLocked(kMcCmdGetInfo, result);
         }
 
+        if (const char *overrideResult = std::getenv("PS2X_MC_GETINFO_RESULT"))
+        {
+            result = static_cast<int32_t>(std::strtol(overrideResult, nullptr, 0));
+            std::lock_guard<std::mutex> lock(g_mcStateMutex);
+            setMcCommandResultLocked(kMcCmdGetInfo, result);
+        }
+
         if (typePtr != 0u)
         {
             if (uint8_t *out = getMemPtr(rdram, typePtr))

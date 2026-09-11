@@ -46,7 +46,8 @@ namespace ps2x::iop::detail
         constexpr uint32_t kMaximumResponseBytes = 0x100u;
         constexpr uint32_t kPadPortCount = 2u;
         constexpr uint32_t kPadSlotCount = 8u;
-        constexpr uint32_t kPadAreaBytes = 0x100u;
+        // Each extended libpad DMA record is 128 bytes; a pair is 256.
+        constexpr uint32_t kPadAreaBytes = 0x80u;
 
         bool isPadmanSid(uint32_t sid)
         {
@@ -86,12 +87,12 @@ namespace ps2x::iop::detail
         {
             area.fill(0u);
 
-            // A connected digital pad reports the standard 0x41/0x5a
-            // header, released buttons, and centered analog axes. The
+            // libpad data starts with status and mode ID, not the SIO2
+            // wire's mode ID / 0x5a acknowledgement pair. The
             // double-buffered area is deterministic for a host without a
             // physical controller backend.
-            area[0x00u] = 0x41u;
-            area[0x01u] = 0x5Au;
+            area[0x00u] = 0u;
+            area[0x01u] = 0x41u;
             area[0x02u] = 0xFFu;
             area[0x03u] = 0xFFu;
             area[0x04u] = 0x80u;
@@ -99,10 +100,12 @@ namespace ps2x::iop::detail
             area[0x06u] = 0x80u;
             area[0x07u] = 0x80u;
             writeU32(area, 0x58u, 1u); // frame
-            writeU32(area, 0x60u, 8u); // data length
-            area[0x74u] = 6u;          // PAD_STATE_STABLE
-            area[0x75u] = 0u;          // PAD_RSTAT_COMPLETE
-            area[0x76u] = 1u;          // current task
+            writeU32(area, 0x60u, 4u); // digital response length
+            area[0x65u] = 0x41u;      // current mode ID
+            area[0x67u] = 1u;         // button data ready
+            area[0x70u] = 6u;         // PAD_STATE_STABLE
+            area[0x71u] = 0u;         // PAD_RSTAT_COMPLETE
+            area[0x72u] = 1u;         // current task
         }
 
         class PadmanService final : public IopService
@@ -349,6 +352,9 @@ namespace ps2x::iop::detail
                 }
                 std::array<uint8_t, kPadAreaBytes> area{};
                 initializePadArea(area);
+                area[0x01u] = state[1];
+                area[0x65u] = state[1];
+                writeU32(area, 0x60u, std::min<uint32_t>(32u, 2u + 2u * (state[1] & 0x0fu)));
                 area[0x02u] = state[2];
                 area[0x03u] = state[3];
                 area[0x04u] = state[4];
