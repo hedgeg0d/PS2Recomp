@@ -1833,7 +1833,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
     if (!valid1 && !valid2)
     {
-        if (presentationLogCount++ < 32u)
+        if (++presentationLogCount <= 32u || presentationLogCount % 60u == 0u)
             std::cerr << "[present] invalid pmode=0x" << std::hex << request.pmode
                       << " dispfb1=0x" << request.dispfb1
                       << " display1=0x" << request.display1 << std::dec << std::endl;
@@ -1932,7 +1932,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                 applyFieldPresentation(result.pixels, result.width, result.height, oddField);
             result.displayFbp = displayFrame1.fbp;
             result.sourceFbp = selected1.fbp;
-            if (presentationLogCount++ < 32u)
+            if (++presentationLogCount <= 32u || presentationLogCount % 60u == 0u)
                 std::cerr << "[present] dual pmode=0x" << std::hex << request.pmode
                           << " fbp1=" << displayFrame1.fbp << " fbp2=" << displayFrame2.fbp
                           << " src1=" << selected1.fbp << " nonblack=" << std::dec
@@ -1953,7 +1953,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     normalizePresentationAlpha(result.pixels, result.width, result.height);
     result.displayFbp = displayFrame.fbp;
     result.sourceFbp = selected.fbp;
-    if (presentationLogCount++ < 32u)
+    if (++presentationLogCount <= 32u || presentationLogCount % 60u == 0u)
         std::cerr << "[present] single pmode=0x" << std::hex << request.pmode
                   << " fbp=" << displayFrame.fbp << " src=" << selected.fbp
                   << " width=" << std::dec << result.width << " height=" << result.height

@@ -317,7 +317,9 @@ namespace ps2_syscalls
                       << std::dec << std::endl;
             ++traceCount;
         }
-        setReturnS32(ctx, result);
+        // The EE syscall returns the started thread ID on success. The
+        // scheduler uses KE_OK internally; do not expose it as a thread ID.
+        setReturnS32(ctx, result == KE_OK ? id : result);
         ee.transferIfRequested(false);
     }
 
