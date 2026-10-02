@@ -180,8 +180,15 @@ namespace ps2x::iop
 
     bool IopSubsystem::hasRpcService(uint32_t sid) const
     {
-        const auto it = m_impl->routes.find(sid);
-        return it != m_impl->routes.end() && it->second != nullptr;
+        // Raw SIF clients can use firmware HLE providers without going
+        // through the EE LoadModule shim. Modern binds still use canBindRpc
+        // and its module-load gate; never advertise an unknown SID here.
+        return std::any_of(m_impl->coreServices.begin(), m_impl->coreServices.end(),
+                           [sid](const auto &service)
+                           {
+                               const auto ids = service->sids();
+                               return std::find(ids.begin(), ids.end(), sid) != ids.end();
+                           });
     }
 
     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
@@ -215,11 +222,23 @@ namespace ps2x::iop
         detail::IopService *hle = route != m_impl->routes.end() ? route->second : nullptr;
 
         RpcResult emulated = m_impl->emulator.handleRpc(request);
-        if (emulated.handled || !hle)
+        if (emulated.handled)
         {
             return emulated;
         }
-        return hle->handleRpc(request);
+        if (!hle)
+        {
+            for (const auto &service : m_impl->coreServices)
+            {
+                const auto ids = service->sids();
+                if (std::find(ids.begin(), ids.end(), request.sid) != ids.end())
+                {
+                    hle = service.get();
+                    break;
+                }
+            }
+        }
+        return hle ? hle->handleRpc(request) : emulated;
     }
 
     void IopSubsystem::onSifTransfer(const SifTransfer &transfer)

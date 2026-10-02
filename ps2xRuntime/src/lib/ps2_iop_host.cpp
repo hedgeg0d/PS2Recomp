@@ -133,6 +133,8 @@ bool PS2IopHostAdapter::guestRange(uint32_t address, size_t size, uint8_t *&begi
 
 bool PS2IopHostAdapter::readGuest(uint32_t address, void *destination, size_t size) const
 {
+    if (ps2_stubs::isSifIopHeapAddress(address))
+        return ps2_stubs::readSifIopHeap(address, destination, size);
     if (!destination && size != 0)
     {
         return false;
@@ -151,6 +153,8 @@ bool PS2IopHostAdapter::readGuest(uint32_t address, void *destination, size_t si
 
 bool PS2IopHostAdapter::writeGuest(uint32_t address, const void *source, size_t size)
 {
+    if (ps2_stubs::isSifIopHeapAddress(address))
+        return ps2_stubs::writeSifIopHeap(address, source, size);
     // TEMP-EXPERIMENT: catch the d0/cc/cursor writer. Revert.
     if (address < 0x5611E0u && address + size > 0x5611C0u)
     {
@@ -254,6 +258,8 @@ bool PS2IopHostAdapter::writeGuest(uint32_t address, const void *source, size_t 
 
 bool PS2IopHostAdapter::zeroGuest(uint32_t address, size_t size)
 {
+    if (ps2_stubs::isSifIopHeapAddress(address))
+        return ps2_stubs::zeroSifIopHeap(address, size);
     uint8_t *destination = nullptr;
     if (!guestRange(address, size, destination))
     {
@@ -270,6 +276,11 @@ bool PS2IopHostAdapter::zeroGuest(uint32_t address, size_t size)
 
 bool PS2IopHostAdapter::normalizeGuestAddress(uint32_t address, uint32_t &normalized) const
 {
+    if (ps2_stubs::isSifIopHeapAddress(address))
+    {
+        normalized = address;
+        return ps2_stubs::isSifIopHeapRange(address, 0u);
+    }
     bool scratchpad = false;
     if (!ps2ResolveGuestPointer(address, normalized, scratchpad) || scratchpad)
     {
@@ -346,13 +357,51 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
 {
     uint8_t *sendPointer = nullptr;
     uint8_t *receivePointer = nullptr;
+    std::vector<uint8_t> sendStorage;
+    std::vector<uint8_t> receiveStorage;
+    const bool sendIsIopHeap = send.address != 0u &&
+                               ps2_stubs::isSifIopHeapAddress(send.address);
+    const bool receiveIsIopHeap = receive.address != 0u &&
+                                  ps2_stubs::isSifIopHeapAddress(receive.address);
+    if (sendIsIopHeap)
+    {
+        sendStorage.resize(send.size);
+        if (!ps2_stubs::readSifIopHeap(send.address, sendStorage.data(), sendStorage.size()))
+        {
+            sendStorage.clear();
+        }
+        else
+        {
+            sendPointer = sendStorage.data();
+        }
+    }
+    if (receiveIsIopHeap)
+    {
+        receiveStorage.resize(receive.size);
+        if (!ps2_stubs::readSifIopHeap(receive.address,
+                                       receiveStorage.data(),
+                                       receiveStorage.size()))
+        {
+            receiveStorage.clear();
+        }
+        else
+        {
+            receivePointer = receiveStorage.data();
+        }
+    }
     if (send.address && !guestRange(send.address, send.size, sendPointer))
     {
-        sendPointer = nullptr;
+        if (!sendIsIopHeap)
+        {
+            sendPointer = nullptr;
+        }
     }
     if (receive.address && !guestRange(receive.address, receive.size, receivePointer))
     {
-        receivePointer = nullptr;
+        if (!receiveIsIopHeap)
+        {
+            receivePointer = nullptr;
+        }
     }
     m_runtime.audioBackend().onSoundCommand(sid,
                                             function,
@@ -360,6 +409,12 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
                                             send.size,
                                             receivePointer,
                                             receive.size);
+    if (receivePointer && receiveIsIopHeap)
+    {
+        (void)ps2_stubs::writeSifIopHeap(receive.address,
+                                         receiveStorage.data(),
+                                         receiveStorage.size());
+    }
 }
 
 std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
