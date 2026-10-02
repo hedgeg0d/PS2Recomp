@@ -256,6 +256,9 @@ namespace ps2_syscalls
         case 0x6B:
             ps2_stubs::sceSifStopDma(rdram, ctx, runtime);
             return true;
+        case static_cast<uint32_t>(-0x68):
+            iFlushCache(rdram, ctx, runtime);
+            return true;
         case 0x6E:
             SetOsdConfigParam2(rdram, ctx, runtime);
             return true;

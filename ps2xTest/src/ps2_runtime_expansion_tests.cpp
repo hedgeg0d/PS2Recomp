@@ -481,26 +481,30 @@ void register_ps2_runtime_expansion_tests()
                      "missing target should remain visible in ctx->pc for diagnostics");
         });
 
-        tc.Run("dispatchGuestBranch treats null indirect callbacks as no-op returns", [](TestCase &t)
+        tc.Run("ContinueToTarget unwinds a missing call without skipping it", [](TestCase &t)
         {
             PS2Runtime runtime;
-            runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
+            runtime.setMissingFunctionPolicy(
+                PS2Runtime::MissingFunctionPolicy::ContinueToTarget);
 
             R5900Context ctx{};
             ctx.pc = 0x2000u;
 
-            const bool resumed = runtime.dispatchGuestBranch(
-                runtime.memory().getRDRAM(),
+            const bool continuedInCaller = runtime.dispatchGuestBranch(
+                nullptr,
                 &ctx,
-                0u,
+                0x3210u,
                 0x2000u,
                 0x2008u,
                 PS2Runtime::GuestBranchKind::IndirectCall,
-                "test-null-callback");
+                "test-missing-unwind");
 
-            t.IsTrue(resumed, "null callback should resume after the call delay slot");
-            t.Equals(ctx.pc, 0x2008u, "null callback should preserve the caller fallthrough PC");
-            t.IsTrue(runtime.isStopRequested(), "null callback remains visible to Stop diagnostics");
+            t.IsFalse(continuedInCaller,
+                      "ContinueToTarget must unwind the generated caller");
+            t.Equals(ctx.pc, 0x3210u,
+                     "the unresolved target should remain visible to the dispatcher");
+            t.IsFalse(runtime.isStopRequested(),
+                      "ContinueToTarget should remain a non-stopping debug policy");
         });
 
         tc.Run("MPEG init and callback stubs return success instead of TODO errors", [](TestCase &t)

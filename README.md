@@ -93,3 +93,30 @@ This is exploratory work. The generic changes will be refined, split into
 focused patches, and proposed as separate PS2Recomp pull requests after the
 Katamari path is understood and regression-tested. The current test baseline is
 449/449; tests are intentionally not run during the bounded game experiments.
+
+### Describing Your Game Project
+
+A game project built with PS2Recomp can describe itself in a `.recomp.json` file at the root of its repository. Lists of recomp and decomp projects, such as [recomp.board](https://recomp.fyi), read that file instead of guessing the game, system and status from the README.
+
+> [!NOTE]
+> This file is optional: PS2Recomp does not read it and works the same without it. `.recomp.json` and recomp.board are third-party projects; the PS2Recomp developers have no ties to them.
+
+Starter file:
+
+```json
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "<title as it shipped>",
+  "system": "PS2",
+  "type": "recomp",
+  "toolchain": "PS2Recomp",
+  "status": "in-progress",
+  "original": { "region": "USA", "serial": "SLUS-20312" }
+}
+```
+
+* `original` is the release a user must own. On retail discs the ELF is named after the serial (`SLUS_203.12` is `SLUS-20312`), and the prefix gives the region: `SLUS`/`SCUS` USA, `SLES`/`SCES` Europe, `SLPS`/`SLPM`/`SCPS` Japan.
+* `status` is one of `exploring`, `in-progress`, `playable`, `released`, `complete`, `paused`. Edit it when the project moves on: a stale status is worse than none.
+* Never put a game file, or a link to one, in the file.
+
+Other fields (Wikidata item, target platforms, maintainers, links, what help is wanted) and the JSON Schema are in the [specification](https://recomp.fyi/spec).
