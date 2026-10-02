@@ -8,7 +8,7 @@ namespace ps2x::iop::detail
 {
     IopModuleManager::IopModuleManager()
     {
-        // ROM modules that the no-BIOS HLE environment can legitimately provide. 
+        // ROM modules that the no-BIOS HLE environment can legitimately provide.
         // Entries with RPC services become routable only after load.
         constexpr std::string_view modules[] = {
             "sysmem",

@@ -423,7 +423,7 @@ namespace ps2recomp
                             }
                         }
                     }
-                   
+
                     else if ((inst.opcode == OPCODE_LW || inst.opcode == OPCODE_SW) && directAddress.hasAddress)
                     {
                         const uint32_t targetAddr = directAddress.address;
@@ -432,7 +432,7 @@ namespace ps2recomp
                         if (
                             (targetAddr >= 0x10000000 && targetAddr < 0x14000000) || // I/O
                             (targetAddr >= 0x70000000 && targetAddr < 0x70004000) // Scratchpad
-                        )   
+                        )
                         {
                             m_mmioByInstructionAddress[inst.address] = targetAddr;
                             std::cout << "Detected MMIO access at " << std::hex << inst.address << " -> " << targetAddr << std::dec << std::endl;
