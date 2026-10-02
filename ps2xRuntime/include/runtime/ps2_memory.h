@@ -4,9 +4,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <deque>
 #include <functional>
 #include <vector>
 #include <unordered_map>
+
+#include "runtime/ipu_mpeg2_decoder.h"
 #include <atomic>
 #include <iostream>
 #include <mutex>
@@ -378,6 +381,47 @@ public:
     std::atomic<uint64_t> m_vu1CodeGeneration{0};
     // I/O registers
     std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
+
+    // IPU (Image Processing Unit) HLE state. Both FIFOs hold 32-bit words
+    // and mirror the hardware 8-qword depth.
+    struct IpuState
+    {
+        static constexpr uint32_t kFifoWords = 32u;
+        static constexpr uint32_t kBdecOutWords = 192u; // 384 16-bit YCbCr samples
+        std::deque<uint32_t> inFifo;
+        std::deque<uint32_t> outFifo;
+        uint32_t cmdData = 0u;
+        uint32_t topData = 0u;
+        bool busy = false;
+        uint32_t bitPos = 0u;
+        // CTRL-preserved decoder setup bits (IDP/AS/IVF/QST/MP1/PCT).
+        uint32_t ctrlKeep = 0u;
+        uint32_t bdecWordsLeft = 0u;
+        std::array<uint32_t, kBdecOutWords> bdecOutput{};
+        uint32_t bdecOutputPos = 0u;
+        uint8_t codedBlockPattern = 0u;
+        bool scd = false; // start-code-detected sticky flag (cleared on command)
+        bool sawSliceCode = false; // MPEG slice seen in this bitstream
+        uint32_t fragBits = 0u; // consumed bits within the head input word
+        // Commands complete with a one-poll BUSY transient (mirrors the worker
+        // delay real hardware/PCSX2 have): the first CMD read after a command
+        // still reports BUSY so the guest runs its wait/feed path once, the
+        // next reads report completion.
+        uint32_t busyPolls = 0u;
+        bool inputChainStarted = false;
+        bool inputChainEndPending = false;
+        IpuMpeg2Decoder mpeg2;
+    };
+    IpuState m_ipu;
+    void writeIpuCommand(uint32_t value);
+    void observeIpuRead();
+    void syncIpuCmdMirror();
+    uint32_t readIpuCtrl() const;
+    uint32_t readIpuBp() const;
+    void runIpuInDma(uint32_t channelBase);
+    void runIpuOutDma(uint32_t channelBase);
+    void resumeIpuOutDma();
+    void fillIpuOutFifo();
 
     // Registers
     GSRegisters gs_regs;

@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -812,6 +813,23 @@ uint64_t PS2Memory::read64(uint32_t address)
     // to avoid any side-effects from read32 handlers.
     if (isIoRegister(physAddr))
     {
+        if (physAddr == 0x10002010u || physAddr == 0x10002020u ||
+            physAddr == 0x10002030u)
+        {
+            // These registers are computed from live IPU state. The generic
+            // IO mirror is not updated when the decoder advances the stream.
+            const uint32_t lo = readIORegister(physAddr);
+            const uint32_t hi = physAddr == 0x10002030u && m_ipu.busy
+                                    ? 0x80000000u : 0u;
+            return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32u);
+        }
+        if (physAddr == 0x10002000u)
+        {
+            // CMD observes the BUSY transient (see writeIpuCommand); the
+            // mirror slots stay coherent for the side-effect-free compose.
+            observeIpuRead();
+            syncIpuCmdMirror();
+        }
         size_t timerIndex = 0u;
         uint32_t timerOffset = 0u;
         if (decodeEeTimerRegister(physAddr, timerIndex, timerOffset))
@@ -951,6 +969,937 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
         uint32_t newValue = (m_ioRegisters[regAddr] & mask) | ((uint32_t)value << shift);
         writeIORegister(regAddr, newValue);
     }
+}
+
+void PS2Memory::syncIpuCmdMirror()
+{
+    // 64-bit CMD reads compose {BUSY, DATA} from these slots without
+    // side effects, so keep them coherent on every state change.
+    m_ioRegisters[0x10002000u] = m_ipu.cmdData;
+    m_ioRegisters[0x10002004u] = m_ipu.busy ? 0x80000000u : 0u;
+}
+
+uint32_t PS2Memory::readIpuCtrl() const
+{
+    uint32_t ifc = static_cast<uint32_t>(m_ipu.inFifo.size() / 4u);
+    uint32_t ofc = static_cast<uint32_t>(m_ipu.outFifo.size() / 4u);
+    if (ifc > 8u)
+        ifc = 8u;
+    if (ofc > 8u)
+        ofc = 8u;
+    uint32_t val = m_ipu.ctrlKeep | (ifc << 0) | (ofc << 4) |
+                   (static_cast<uint32_t>(m_ipu.codedBlockPattern) << 8u);
+    if (m_ipu.scd)
+        val |= (1u << 15);
+    if (m_ipu.busy)
+        val |= (1u << 31);
+    return val;
+}
+
+uint32_t PS2Memory::readIpuBp() const
+{
+    uint32_t ifc = static_cast<uint32_t>(m_ipu.inFifo.size() / 4u);
+    if (ifc > 8u)
+        ifc = 8u;
+    // Consumed words are removed individually, but DMA advances by whole
+    // quadwords. Account for the remaining partial quadword as the internal
+    // bitstream buffer (FP), otherwise guest save/restore loses 16 bytes.
+    const uint32_t fp = (m_ipu.inFifo.size() % 4u) != 0u ? 1u : 0u;
+    return (m_ipu.bitPos & 0x7Fu) | (ifc << 8) | (fp << 16);
+}
+
+void PS2Memory::observeIpuRead()
+{
+    // Any IPU register read observes the BUSY transient (see
+    // writeIpuCommand); the worker delay is discretized to polls.
+    if (m_ipu.busy && ++m_ipu.busyPolls >= 2u)
+    {
+        m_ipu.busy = false;
+        syncIpuCmdMirror();
+    }
+}
+
+void PS2Memory::writeIpuCommand(uint32_t value)
+{
+    static std::atomic<uint32_t> bdecCount{0u};
+    static std::atomic<uint32_t> fdecCount{0u};
+    static std::atomic<uint32_t> vdecCount{0u};
+    static std::atomic<uint32_t> commandCount{0u};
+    const uint32_t cmd = (value >> 28) & 0xFu;
+    const uint32_t commandIndex = commandCount.fetch_add(1u, std::memory_order_relaxed);
+    if (commandIndex < 10000u)
+    {
+        std::cerr << "[probe:ipu-command] n=" << commandIndex
+                  << " cmd=0x" << std::hex << cmd
+                  << " value=0x" << value
+                  << " bit=0x" << m_ipu.bitPos
+                  << " frag=0x" << m_ipu.fragBits
+                  << std::dec << '\n';
+    }
+    m_ipu.cmdData = value;
+    m_ipu.scd = false;
+    m_ipu.ctrlKeep &= ~(1u << 14); // ECD is cleared by every new command.
+    // Data commands (IDEC/BDEC/VDEC/FDEC) run through the BUSY transient so
+    // the guest observes BUSY once and runs its wait/feed path; setup
+    // commands complete instantly (hardware/PCSX2 behavior).
+    const bool dataCmd = cmd == 0x1u || cmd == 0x2u || cmd == 0x3u || cmd == 0x4u;
+    m_ipu.busy = dataCmd;
+    m_ipu.busyPolls = 0u;
+    syncIpuCmdMirror();
+
+    auto refillInput = [this]() {
+        if ((m_ioRegisters[0x1000B400u] & 0x100u) != 0u)
+            runIpuInDma(0x1000B400u);
+    };
+    auto normalizeInput = [this, &refillInput]() {
+        refillInput();
+        while (m_ipu.fragBits >= 32u && !m_ipu.inFifo.empty())
+        {
+            m_ipu.inFifo.pop_front();
+            m_ipu.fragBits -= 32u;
+            refillInput();
+        }
+        return m_ipu.fragBits < 32u;
+    };
+    auto advanceInput = [this, &refillInput, &normalizeInput](uint32_t bits) {
+        if (!normalizeInput())
+            return false;
+        while (bits != 0u)
+        {
+            if (m_ipu.inFifo.empty())
+            {
+                refillInput();
+                if (m_ipu.inFifo.empty())
+                    return false;
+            }
+            const uint32_t avail = 32u - m_ipu.fragBits;
+            const uint32_t take = bits < avail ? bits : avail;
+            m_ipu.fragBits += take;
+            m_ipu.bitPos += take;
+            bits -= take;
+            if (m_ipu.fragBits == 32u)
+            {
+                m_ipu.inFifo.pop_front();
+                m_ipu.fragBits = 0u;
+                refillInput();
+            }
+        }
+        return true;
+    };
+    auto peekInput = [this, &normalizeInput](uint32_t bits, uint32_t &result) {
+        if (bits > 32u || !normalizeInput())
+            return false;
+        result = 0u;
+        for (uint32_t bit = 0u; bit < bits; ++bit)
+        {
+            const uint32_t absolute = m_ipu.fragBits + bit;
+            const size_t wordIndex = absolute / 32u;
+            if (wordIndex >= m_ipu.inFifo.size())
+                return false;
+            const uint32_t withinWord = absolute % 32u;
+            const uint32_t byteIndex = withinWord / 8u;
+            const uint32_t bitInByte = withinWord % 8u;
+            const uint8_t byte = static_cast<uint8_t>(m_ipu.inFifo[wordIndex] >> (byteIndex * 8u));
+            result = (result << 1u) | ((byte >> (7u - bitInByte)) & 1u);
+        }
+        return true;
+    };
+
+    switch (cmd)
+    {
+    case 0x0u: // BCLR: clear input FIFO and set the bit pointer (0..127).
+        m_ipu.inFifo.clear();
+        m_ipu.outFifo.clear();
+        m_ipu.bitPos = value & 0x7Fu;
+        // Values above 31 skip complete words after DMA refills the FIFO.
+        m_ipu.fragBits = value & 0x7Fu;
+        m_ipu.bdecWordsLeft = 0u;
+        m_ipu.bdecOutputPos = 0u;
+        m_ipu.codedBlockPattern = 0u;
+        m_ipu.topData = 0u;
+        m_ipu.busy = false;
+        break;
+    case 0x4u: // FDEC: skip bits, report a start code at the new position.
+    {
+        advanceInput(value & 0x3Fu);
+        refillInput();
+        // FDEC returns the next 32 MPEG bits in stream order. FIFO words are
+        // little-endian host words, while bits inside each stream byte are
+        // consumed MSB first.
+        uint32_t decoded = 0u;
+        bool haveDecoded = true;
+        for (uint32_t bit = 0u; bit < 32u; ++bit)
+        {
+            const uint32_t absolute = m_ipu.fragBits + bit;
+            const size_t wordIndex = absolute / 32u;
+            if (wordIndex >= m_ipu.inFifo.size())
+            {
+                haveDecoded = false;
+                break;
+            }
+            const uint32_t withinWord = absolute % 32u;
+            const uint32_t byteIndex = withinWord / 8u;
+            const uint32_t bitInByte = withinWord % 8u;
+            const uint8_t byte = static_cast<uint8_t>(m_ipu.inFifo[wordIndex] >> (byteIndex * 8u));
+            decoded = (decoded << 1u) | ((byte >> (7u - bitInByte)) & 1u);
+        }
+        if (haveDecoded)
+        {
+            m_ipu.cmdData = decoded;
+            m_ipu.topData = decoded;
+            // Some direct-IPU MPEG consumers use the status bit as the
+            // boundary notification after FDEC rather than after BDEC. Keep
+            // this opt-in until validated against more streams.
+            const char *fdecEcd = std::getenv("PS2X_IPU_FDEC_ECD");
+            if (fdecEcd != nullptr && fdecEcd[0] != '\0' &&
+                m_ipu.sawSliceCode &&
+                (decoded & 0xFFFFFF00u) == 0x00000100u)
+            {
+                m_ipu.ctrlKeep |= 1u << 14u;
+            }
+            if ((decoded & 0xFFFFFF00u) == 0x00000100u &&
+                (decoded & 0xFFu) >= 0x01u && (decoded & 0xFFu) <= 0xAFu)
+                m_ipu.sawSliceCode = true;
+        }
+
+        // Keep a byte-oriented diagnostic view of the same position.
+        uint8_t peek[7] = {0u, 0u, 0u, 0u, 0u, 0u, 0u};
+        uint32_t peekBytes = 0u;
+        {
+            uint64_t acc = 0u;
+            uint32_t accBits = 0u;
+            size_t wi = 0u;
+            uint32_t frag = m_ipu.fragBits;
+            while (peekBytes < sizeof(peek) && wi < m_ipu.inFifo.size())
+            {
+                acc |= static_cast<uint64_t>(m_ipu.inFifo[wi] >> frag) << accBits;
+                const uint32_t got = 32u - frag;
+                accBits += got;
+                ++wi;
+                frag = 0u;
+                while (accBits >= 8u && peekBytes < sizeof(peek))
+                {
+                    peek[peekBytes++] = static_cast<uint8_t>(acc & 0xFFu);
+                    acc >>= 8;
+                    accBits -= 8u;
+                }
+            }
+        }
+        const uint32_t n = fdecCount.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 2000u)
+        {
+            std::cerr << "[probe:ipu-fdec] n=" << n
+                      << " bit=0x" << std::hex << m_ipu.bitPos
+                      << " skip=0x" << std::hex << (value & 0x3Fu)
+                      << " scd=0x" << (m_ipu.scd ? 1u : 0u)
+                      << " data=0x" << m_ipu.cmdData
+                      << " inQw=0x" << m_ipu.inFifo.size() / 4u
+                      << " peek=0x" << peekBytes
+                      << std::dec << '\n';
+        }
+        break;
+    }
+    case 0x2u: // BDEC: decode one macroblock.
+    {
+        // BDEC returns planar 16-bit YCbCr: 256 Y + 64 Cb + 64 Cr samples.
+        // Unlike frame-level FFmpeg HLE, this also advances the exact MPEG VLC
+        // bit count and preserves non-intra residual samples for guest motion
+        // compensation.
+        const uint32_t commandStartBit = m_ipu.bitPos;
+        advanceInput(value & 0x3Fu);
+        const uint32_t decodeStartBit = m_ipu.bitPos;
+
+        IpuMpeg2Decoder::BdecConfig config{};
+        config.qScaleCode = static_cast<uint8_t>((value >> 16u) & 0x1Fu);
+        config.interlacedDct = (value & (1u << 25u)) != 0u;
+        config.dcReset = (value & (1u << 26u)) != 0u;
+        config.macroblockIntra = (value & (1u << 27u)) != 0u;
+        config.intraDcPrecision = static_cast<uint8_t>((m_ipu.ctrlKeep >> 16u) & 0x3u);
+        config.alternateScan = (m_ipu.ctrlKeep & (1u << 20u)) != 0u;
+        config.intraVlcFormat = (m_ipu.ctrlKeep & (1u << 21u)) != 0u;
+        config.nonlinearQScale = (m_ipu.ctrlKeep & (1u << 22u)) != 0u;
+        config.mpeg1 = (m_ipu.ctrlKeep & (1u << 23u)) != 0u;
+
+        std::array<uint16_t, IpuMpeg2Decoder::kMacroblockSamples> samples{};
+        const bool decoded = m_ipu.mpeg2.decodeMacroblock(
+            config, peekInput, advanceInput, samples, m_ipu.codedBlockPattern);
+        const uint32_t decodeEndBit = m_ipu.bitPos;
+        uint32_t nextByte = 0u;
+        uint32_t scanPrefix = 0u;
+        if (decoded)
+        {
+            for (uint32_t i = 0u; i < IpuState::kBdecOutWords; ++i)
+            {
+                m_ipu.bdecOutput[i] = static_cast<uint32_t>(samples[i * 2u]) |
+                                      (static_cast<uint32_t>(samples[i * 2u + 1u]) << 16u);
+            }
+            m_ipu.bdecOutputPos = 0u;
+            m_ipu.bdecWordsLeft = IpuState::kBdecOutWords;
+
+            // Hardware aligns and scans zero bytes after a macroblock. Leave
+            // the cursor at a 00 00 01 prefix and expose it through SCD/TOP.
+            if (peekInput(8u, nextByte) && nextByte == 0u)
+            {
+                const uint32_t alignBits = (8u - (m_ipu.fragBits & 7u)) & 7u;
+                advanceInput(alignBits);
+                while (peekInput(24u, scanPrefix) && scanPrefix == 0u)
+                    advanceInput(8u);
+                if (scanPrefix == 1u)
+                    m_ipu.scd = true;
+                else if (scanPrefix != 0u)
+                    m_ipu.ctrlKeep |= 1u << 14u; // ECD: next start code is not a slice.
+            }
+            uint32_t top = 0u;
+            if (peekInput(32u, top))
+            {
+                m_ipu.topData = top;
+                // BDEC leaves CMD as a bitstream peek; only FDEC/VDEC
+                // expose a latched command result instead.
+                m_ipu.cmdData = top;
+            }
+
+        }
+        else
+        {
+            m_ipu.ctrlKeep |= 1u << 14u;
+            m_ipu.bdecOutput.fill(0u);
+            m_ipu.bdecOutputPos = 0u;
+            m_ipu.bdecWordsLeft = IpuState::kBdecOutWords;
+        }
+        fillIpuOutFifo();
+        const uint32_t n = bdecCount.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 2048u)
+        {
+            const uint32_t nonzero = static_cast<uint32_t>(std::count_if(
+                samples.begin(), samples.end(), [](uint16_t sample) { return sample != 0u; }));
+            std::cerr << "[probe:ipu-bdec] n=" << n
+                      << " cmd=0x" << std::hex << value
+                      << " ok=0x" << (decoded ? 1u : 0u)
+                      << " samples=" << std::dec << nonzero
+                      << " y0=" << samples[0] << " cb0=" << samples[256] << " cr0=" << samples[320]
+                      << std::hex
+                      << " cbp=0x" << static_cast<uint32_t>(m_ipu.codedBlockPattern)
+                      << " begin=0x" << commandStartBit
+                      << " decode=0x" << decodeStartBit << "-0x" << decodeEndBit
+                      << " end=0x" << m_ipu.bitPos
+                      << " scd=0x" << (m_ipu.scd ? 1u : 0u)
+                      << " ecd=0x" << ((m_ipu.ctrlKeep >> 14u) & 1u)
+                      << " next=0x" << nextByte << " prefix=0x" << scanPrefix
+                      << " top=0x" << m_ipu.topData
+                      << " inQw=0x" << m_ipu.inFifo.size() / 4u
+                      << " outQw=0x" << m_ipu.outFifo.size() / 4u
+                      << std::dec << '\n';
+        }
+        resumeIpuOutDma();
+        break;
+    }
+    case 0x3u: // VDEC: decode a variable-length MPEG field.
+    {
+        advanceInput(value & 0x3Fu);
+        uint32_t code16 = 0u;
+        uint32_t result = 0u;
+        uint32_t length = 0u;
+        const uint32_t table = (value >> 26) & 0x3u;
+
+        // Table 0: macroblock_address_increment (ISO/IEC 13818-2 B-1).
+        // The compact ranges below are the expanded hardware lookup table.
+        if (table == 0u && peekInput(16u, code16))
+        {
+            const uint32_t code5 = code16 >> 11u;
+            const uint32_t code11 = code16 >> 5u;
+            uint32_t increment = 0u;
+            if (code5 >= 2u)
+            {
+                if (code5 >= 16u) { increment = 1u; length = 1u; }
+                else if (code5 >= 12u) { increment = 2u; length = 3u; }
+                else if (code5 >= 8u) { increment = 3u; length = 3u; }
+                else if (code5 >= 6u) { increment = 4u; length = 4u; }
+                else if (code5 >= 4u) { increment = 5u; length = 4u; }
+                else if (code5 == 3u) { increment = 6u; length = 5u; }
+                else { increment = 7u; length = 5u; }
+            }
+            else if (code11 >= 24u)
+            {
+                if (code11 <= 35u) { increment = 57u - code11; length = 11u; }
+                else if (code11 <= 47u) { increment = 21u - ((code11 - 36u) / 2u); length = 10u; }
+                else if (code11 <= 55u) { increment = 15u; length = 8u; }
+                else if (code11 <= 63u) { increment = 14u; length = 8u; }
+                else if (code11 <= 71u) { increment = 13u; length = 8u; }
+                else if (code11 <= 79u) { increment = 12u; length = 8u; }
+                else if (code11 <= 87u) { increment = 11u; length = 8u; }
+                else if (code11 <= 95u) { increment = 10u; length = 8u; }
+                else if (code11 <= 111u) { increment = 9u; length = 7u; }
+                else { increment = 8u; length = 7u; }
+            }
+            else if (code11 == 8u)
+            {
+                // macroblock_escape
+                increment = 0x23u;
+                length = 11u;
+            }
+            else if (code11 == 15u && (m_ipu.ctrlKeep & (1u << 23)) != 0u)
+            {
+                // MPEG-1 macroblock_stuffing
+                increment = 0x22u;
+                length = 11u;
+            }
+
+            if (length != 0u)
+            {
+                advanceInput(length);
+                result = increment | (length << 16u);
+            }
+        }
+        else if (table == 1u && peekInput(16u, code16))
+        {
+            // Macroblock type. VDEC uses frame-predicted DCT mode, matching
+            // the IPU's standalone VLC operation.
+            constexpr uint32_t kIntra = 1u;
+            constexpr uint32_t kPattern = 2u;
+            constexpr uint32_t kBackward = 4u;
+            constexpr uint32_t kForward = 8u;
+            constexpr uint32_t kQuant = 16u;
+            constexpr uint32_t kMcFrame = 128u;
+            const uint32_t pictureType = (m_ipu.ctrlKeep >> 24u) & 0x7u;
+            const uint32_t code6 = code16 >> 10u;
+            uint32_t modes = 0u;
+
+            if (pictureType <= 1u)
+            {
+                const uint32_t code2 = code16 >> 14u;
+                if (code2 == 1u) { modes = kIntra | kQuant; length = 2u; }
+                else if (code2 >= 2u) { modes = kIntra; length = 1u; }
+            }
+            else if (pictureType == 2u && code6 != 0u)
+            {
+                if (code6 == 1u) { modes = kIntra | kQuant; length = 6u; }
+                else if (code6 <= 3u) { modes = kPattern | kQuant; length = 5u; }
+                else if (code6 <= 5u) { modes = kForward | kPattern | kQuant; length = 5u; }
+                else if (code6 <= 7u) { modes = kIntra; length = 5u; }
+                else if (code6 <= 15u) { modes = kForward; length = 3u; }
+                else if (code6 <= 31u) { modes = kPattern; length = 2u; }
+                else { modes = kForward | kPattern; length = 1u; }
+                if ((modes & kForward) != 0u)
+                    modes |= kMcFrame;
+            }
+            else if (pictureType == 3u && code6 != 0u)
+            {
+                if (code6 == 1u) { modes = kIntra | kQuant; length = 6u; }
+                else if (code6 == 2u) { modes = kBackward | kPattern | kQuant; length = 6u; }
+                else if (code6 == 3u) { modes = kForward | kPattern | kQuant; length = 6u; }
+                else if (code6 <= 5u) { modes = kForward | kBackward | kPattern | kQuant; length = 5u; }
+                else if (code6 <= 7u) { modes = kIntra; length = 5u; }
+                else if (code6 <= 11u) { modes = kForward; length = 4u; }
+                else if (code6 <= 15u) { modes = kForward | kPattern; length = 4u; }
+                else if (code6 <= 23u) { modes = kBackward; length = 3u; }
+                else if (code6 <= 31u) { modes = kBackward | kPattern; length = 3u; }
+                else if (code6 <= 47u) { modes = kForward | kBackward; length = 2u; }
+                else { modes = kForward | kBackward | kPattern; length = 2u; }
+                modes |= kMcFrame;
+            }
+
+            if (length != 0u)
+            {
+                advanceInput(length);
+                result = modes;
+                if (pictureType == 3u)
+                    result |= length << 16u;
+            }
+        }
+        else if (table == 2u && peekInput(16u, code16))
+        {
+            // Motion code (Table B-10).
+            if ((code16 & 0x8000u) != 0u)
+            {
+                advanceInput(1u);
+                result = 0x00010000u;
+            }
+            else
+            {
+                uint32_t delta = 0u;
+                const uint32_t code4 = code16 >> 12u;
+                if ((code16 & 0xF000u) != 0u || (code16 & 0xFC00u) == 0x0C00u)
+                {
+                    if (code4 == 0u) { delta = 3u; length = 6u; }
+                    else if (code4 == 1u) { delta = 2u; length = 4u; }
+                    else if (code4 <= 3u) { delta = 1u; length = 3u; }
+                    else { delta = 0u; length = 2u; }
+                }
+                else
+                {
+                    const uint32_t code10 = code16 >> 6u;
+                    if (code10 <= 11u) { delta = 0u; length = 10u; }
+                    else if (code10 <= 17u) { delta = 27u - code10; length = 10u; }
+                    else if (code10 <= 19u) { delta = 9u; length = 9u; }
+                    else if (code10 <= 21u) { delta = 8u; length = 9u; }
+                    else if (code10 <= 23u) { delta = 7u; length = 9u; }
+                    else if (code10 <= 31u) { delta = 6u; length = 7u; }
+                    else if (code10 <= 39u) { delta = 5u; length = 7u; }
+                    else if (code10 <= 47u) { delta = 4u; length = 7u; }
+                }
+                if (length != 0u)
+                {
+                    advanceInput(length);
+                    uint32_t sign = 0u;
+                    peekInput(1u, sign);
+                    advanceInput(1u);
+                    const int32_t magnitude = static_cast<int32_t>(delta + 1u);
+                    const int32_t signedDelta = sign != 0u ? -magnitude : magnitude;
+                    result = static_cast<uint32_t>(signedDelta) | (length << 16u);
+                }
+            }
+        }
+        else if (table == 3u)
+        {
+            // Dual-prime motion vector (Table B-11).
+            uint32_t code2 = 0u;
+            if (peekInput(2u, code2))
+            {
+                int32_t dmv = 0;
+                length = code2 < 2u ? 1u : 2u;
+                if (code2 == 2u) dmv = 1;
+                else if (code2 == 3u) dmv = -1;
+                advanceInput(length);
+                result = static_cast<uint32_t>(dmv) | (length << 16u);
+            }
+        }
+
+        m_ipu.cmdData = result;
+        if (result == 0u)
+            m_ipu.ctrlKeep |= 1u << 14;
+        uint32_t top = 0u;
+        if (peekInput(32u, top))
+            m_ipu.topData = top;
+        const uint32_t n = vdecCount.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 24u)
+        {
+            std::cerr << "[probe:ipu-vdec] n=" << n
+                      << " table=0x" << std::hex << table
+                      << " code=0x" << code16
+                      << " result=0x" << result
+                      << " top=0x" << m_ipu.topData
+                      << " bp=0x" << (m_ipu.bitPos & 0x7Fu)
+                      << std::dec << '\n';
+        }
+        break;
+    }
+    case 0x5u: // SETIQ: skip bits, then consume one 8x8 quantization matrix.
+    {
+        advanceInput(value & 0x3Fu);
+        std::array<uint8_t, 64> matrix{};
+        bool complete = true;
+        for (uint8_t &entry : matrix)
+        {
+            uint32_t byte = 0u;
+            if (!peekInput(8u, byte) || !advanceInput(8u))
+            {
+                complete = false;
+                break;
+            }
+            entry = static_cast<uint8_t>(byte);
+        }
+        if (complete)
+            m_ipu.mpeg2.setQuantMatrix((value & (1u << 27u)) == 0u, matrix);
+        else
+            m_ipu.ctrlKeep |= 1u << 14u;
+        m_ipu.busy = false;
+        break;
+    }
+    case 0x7u: // CSC: planar 4:2:0 YCbCr macroblocks to RGB.
+    {
+        const uint32_t macroblocks = value & 0x7FFu;
+        const bool dither = (value & (1u << 26u)) != 0u;
+        const bool rgb16 = (value & (1u << 27u)) != 0u;
+        std::cerr << "[probe:ipu-csc-start] mb=" << macroblocks
+                  << " inQwc=0x" << std::hex << m_ioRegisters[0x1000B420u]
+                  << " inChcr=0x" << m_ioRegisters[0x1000B400u]
+                  << " inMadr=0x" << m_ioRegisters[0x1000B410u]
+                  << " inFirst=0x" << (m_ipu.inFifo.empty() ? 0u : m_ipu.inFifo.front())
+                  << " outMadr=0x" << m_ioRegisters[0x1000B010u]
+                  << " outQwc=0x" << m_ioRegisters[0x1000B020u]
+                  << " outChcr=0x" << m_ioRegisters[0x1000B000u]
+                  << " inWords=0x" << m_ipu.inFifo.size()
+                  << " outWords=0x" << m_ipu.outFifo.size() << std::dec << '\n';
+        bool complete = true;
+        uint32_t mb = 0u;
+        for (; mb < macroblocks && complete; ++mb)
+        {
+            std::array<uint8_t, 384> ycbcr{};
+            for (uint8_t &sample : ycbcr)
+            {
+                uint32_t byte = 0u;
+                if (!peekInput(8u, byte) || !advanceInput(8u))
+                {
+                    complete = false;
+                    break;
+                }
+                sample = static_cast<uint8_t>(byte);
+            }
+            if (!complete)
+                break;
+
+            auto emit = [this](uint32_t word) {
+                if (m_ipu.outFifo.size() >= IpuState::kFifoWords)
+                    resumeIpuOutDma();
+                if (m_ipu.outFifo.size() >= IpuState::kFifoWords)
+                    return false;
+                m_ipu.outFifo.push_back(word);
+                resumeIpuOutDma();
+                return true;
+            };
+            for (uint32_t y = 0u; y < 16u && complete; ++y)
+            {
+                for (uint32_t x = 0u; x < 16u; ++x)
+                {
+                    const int luma = (0x95 * std::max(0, static_cast<int>(ycbcr[y * 16u + x]) - 16)) >> 6;
+                    const int cb = static_cast<int>(ycbcr[256u + (y / 2u) * 8u + x / 2u]) - 128;
+                    const int cr = static_cast<int>(ycbcr[320u + (y / 2u) * 8u + x / 2u]) - 128;
+                    int r = std::clamp((luma + ((0xCC * cr) >> 6) + 1) >> 1, 0, 255);
+                    int g = std::clamp((luma + ((-0x68 * cr) >> 6) + ((-0x32 * cb) >> 6) + 1) >> 1, 0, 255);
+                    int b = std::clamp((luma + ((0x102 * cb) >> 6) + 1) >> 1, 0, 255);
+                    if (!rgb16)
+                    {
+                        complete = emit(static_cast<uint32_t>(r) |
+                                        (static_cast<uint32_t>(g) << 8u) |
+                                        (static_cast<uint32_t>(b) << 16u) | 0x80000000u);
+                    }
+                    else if ((x & 1u) != 0u)
+                    {
+                        auto pack16 = [dither](int pr, int pg, int pb, uint32_t px, uint32_t py) {
+                            static constexpr int matrix[4][4] = {
+                                {-4, 0, -3, 1}, {2, -2, 3, -1},
+                                {-3, 1, -4, 0}, {3, -1, 2, -2}};
+                            const int d = dither ? matrix[py & 3u][px & 3u] : 0;
+                            pr = std::clamp(pr + d, 0, 255);
+                            pg = std::clamp(pg + d, 0, 255);
+                            pb = std::clamp(pb + d, 0, 255);
+                            return static_cast<uint16_t>((pr >> 3) | ((pg >> 3) << 5) |
+                                                         ((pb >> 3) << 10) | 0x8000);
+                        };
+                        const uint32_t px0 = x - 1u;
+                        const int y0 = (0x95 * std::max(0, static_cast<int>(ycbcr[y * 16u + px0]) - 16)) >> 6;
+                        const int cb0 = static_cast<int>(ycbcr[256u + (y / 2u) * 8u + px0 / 2u]) - 128;
+                        const int cr0 = static_cast<int>(ycbcr[320u + (y / 2u) * 8u + px0 / 2u]) - 128;
+                        const int r0 = std::clamp((y0 + ((0xCC * cr0) >> 6) + 1) >> 1, 0, 255);
+                        const int g0 = std::clamp((y0 + ((-0x68 * cr0) >> 6) + ((-0x32 * cb0) >> 6) + 1) >> 1, 0, 255);
+                        const int b0 = std::clamp((y0 + ((0x102 * cb0) >> 6) + 1) >> 1, 0, 255);
+                        complete = emit(static_cast<uint32_t>(pack16(r0, g0, b0, px0, y)) |
+                                        (static_cast<uint32_t>(pack16(r, g, b, x, y)) << 16u));
+                    }
+                    if (!complete)
+                        break;
+                }
+            }
+        }
+        if (!complete)
+            m_ipu.ctrlKeep |= 1u << 14u;
+        std::cerr << "[probe:ipu-csc-end] mb=" << mb
+                  << " complete=" << complete
+                  << " bit=0x" << std::hex << m_ipu.bitPos
+                  << " inQwc=0x" << m_ioRegisters[0x1000B420u]
+                  << " inChcr=0x" << m_ioRegisters[0x1000B400u]
+                  << " outMadr=0x" << m_ioRegisters[0x1000B010u]
+                  << " outQwc=0x" << m_ioRegisters[0x1000B020u]
+                  << " outChcr=0x" << m_ioRegisters[0x1000B000u]
+                  << " inWords=0x" << m_ipu.inFifo.size()
+                  << " outWords=0x" << m_ipu.outFifo.size() << std::dec << '\n';
+        if (complete && !rgb16)
+        {
+            const uint32_t bytes = macroblocks * 1024u;
+            const uint32_t end = m_ioRegisters[0x1000B010u] & 0x1FFFFFFu;
+            if (end >= bytes && end <= PS2_RAM_SIZE)
+            {
+                const uint8_t *pixels = m_rdram + end - bytes;
+                uint32_t colored = 0u;
+                uint32_t opaque = 0u;
+                for (uint32_t i = 0u; i < bytes; i += 4u)
+                {
+                    colored += (pixels[i] | pixels[i + 1u] | pixels[i + 2u]) != 0u;
+                    opaque += pixels[i + 3u] == 0x80u;
+                }
+                std::cerr << "[probe:ipu-csc-frame] rgb=0x" << std::hex << (end - bytes)
+                          << " bytes=0x" << bytes << std::dec
+                          << " colored=" << colored << " opaque=" << opaque << '\n';
+                if (const char *dump = std::getenv("PS2X_IPU_CSC_DUMP"))
+                {
+                    static uint32_t dumpIndex = 0u;
+                    const uint32_t frameIndex = dumpIndex++;
+                    if ((frameIndex < 4u || (frameIndex < 1000u && frameIndex % 10u == 0u)) && *dump != '\0')
+                    {
+                        const std::string path = std::string(dump) + "-" +
+                                                 std::to_string(frameIndex) + ".rgba";
+                        if (std::FILE *file = std::fopen(path.c_str(), "wb"))
+                        {
+                            std::fwrite(pixels, 1u, bytes, file);
+                            std::fclose(file);
+                        }
+                    }
+                }
+            }
+        }
+        m_ipu.busy = false;
+        break;
+    }
+    case 0x1u: // IDEC
+    case 0x6u: // SETVQ
+    case 0x8u: // PACK
+    case 0x9u: // SETTH
+    default:
+        // Latched only for now; the BUSY transient below still applies.
+        break;
+    }
+    // No synchronous clear: BUSY stays set until observed twice via 64-bit
+    // CMD reads (see read64), giving the guest its wait/feed window.
+    syncIpuCmdMirror();
+
+}
+
+void PS2Memory::runIpuInDma(uint32_t channelBase)
+{
+    uint32_t madr = m_ioRegisters[channelBase + 0x10u];
+    uint32_t qwc = m_ioRegisters[channelBase + 0x20u];
+    uint32_t chcr = m_ioRegisters[channelBase + 0x00u];
+    const uint32_t mode = (chcr >> 2) & 0x3u;
+    bool transferEnded = false;
+    static std::atomic<uint32_t> inDmaCount{0u};
+    const uint32_t n = inDmaCount.fetch_add(1u, std::memory_order_relaxed);
+    if (n < 2048u)
+    {
+        std::cerr << "[probe:ipu-indma] n=" << n
+                  << " madr=0x" << std::hex << madr
+                  << " qwc=0x" << qwc << " mode=0x" << mode
+                  << std::dec << '\n';
+    }
+    auto appendQwords = [&](uint32_t source, uint32_t count) -> uint32_t
+    {
+        const uint32_t freeQwc = static_cast<uint32_t>((IpuState::kFifoWords - m_ipu.inFifo.size()) / 4u);
+        count = std::min(count, freeQwc);
+        if (count == 0u)
+            return 0u;
+        // In DMAC MADR/TADR, bit 31 selects scratchpad. This is distinct
+        // from the EE's 0x70000000 scratchpad virtual-address window.
+        const bool scratch = (source & 0x80000000u) != 0u || isScratchpad(source);
+        uint32_t phys = 0u;
+        try
+        {
+            phys = scratch ? (source & 0x3FF0u) : translateAddress(source);
+        }
+        catch (const std::exception &)
+        {
+            return 0u;
+        }
+        const uint8_t *base = scratch ? m_scratchpad : m_rdram;
+        const uint32_t limit = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+        const uint64_t bytes = static_cast<uint64_t>(count) * 16u;
+        if (phys > limit || bytes > static_cast<uint64_t>(limit - phys))
+            return 0u;
+        for (uint32_t qw = 0u; qw < count; ++qw)
+        {
+            for (uint32_t i = 0u; i < 4u; ++i)
+            {
+                uint32_t w = 0u;
+                std::memcpy(&w, base + phys + qw * 16u + i * 4u, sizeof(w));
+                m_ipu.inFifo.push_back(w);
+            }
+        }
+        return count;
+    };
+
+    if (mode == 0u)
+    {
+        m_ipu.inputChainStarted = false;
+        m_ipu.inputChainEndPending = false;
+        const uint32_t moved = appendQwords(madr, qwc);
+        madr += moved * 16u;
+        qwc -= moved;
+    }
+    else if (mode == 1u)
+    {
+        uint32_t tagAddr = m_ioRegisters[channelBase + 0x30u];
+        uint32_t asr0 = m_ioRegisters[channelBase + 0x40u];
+        uint32_t asr1 = m_ioRegisters[channelBase + 0x50u];
+        uint32_t asp = (chcr >> 4u) & 0x3u;
+        const bool tie = (chcr & 0x80u) != 0u;
+        uint32_t tags = 0u;
+        while (m_ipu.inFifo.size() + 4u <= IpuState::kFifoWords && tags < 64u)
+        {
+            if (qwc == 0u)
+            {
+                // Finish the previous tag only after its payload drained.
+                if (m_ipu.inputChainStarted && m_ipu.inputChainEndPending)
+                {
+                    transferEnded = true;
+                    break;
+                }
+
+                const bool tagScratch = (tagAddr & 0x80000000u) != 0u || isScratchpad(tagAddr);
+                uint32_t tagPhys = 0u;
+                try { tagPhys = tagScratch ? (tagAddr & 0x3FF0u) : translateAddress(tagAddr); }
+                catch (const std::exception &) { break; }
+                const uint8_t *tagBase = tagScratch ? m_scratchpad : m_rdram;
+                const uint32_t tagLimit = tagScratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                if (tagPhys + 16u > tagLimit)
+                    break;
+                uint64_t tag = 0u;
+                std::memcpy(&tag, tagBase + tagPhys, sizeof(tag));
+                qwc = static_cast<uint32_t>(tag & 0xFFFFu);
+                const uint32_t id = static_cast<uint32_t>((tag >> 28u) & 0x7u);
+                const uint32_t addr = static_cast<uint32_t>((tag >> 32u) & 0x7FFFFFFFu);
+                madr = tagAddr + 16u;
+                uint32_t nextTag = madr + qwc * 16u;
+                switch (id)
+                {
+                case 0u: madr = addr; nextTag = tagAddr + 16u; break;              // REFE
+                case 1u: break;                                                    // CNT
+                case 2u: nextTag = addr; break;                                    // NEXT
+                case 3u:                                                          // REF
+                case 4u: madr = addr; nextTag = tagAddr + 16u; break;              // REFS
+                case 5u:                                                          // CALL
+                    if (asp == 0u) { asr0 = nextTag; asp = 1u; }
+                    else if (asp == 1u) { asr1 = nextTag; asp = 2u; }
+                    nextTag = addr;
+                    break;
+                case 6u:                                                          // RET
+                    if (asp == 2u) { nextTag = asr1; asp = 1u; }
+                    else if (asp == 1u) { nextTag = asr0; asp = 0u; }
+                    break;
+                case 7u: break;                                                    // END
+                }
+                tagAddr = nextTag;
+                chcr = (chcr & 0x0000FFFFu) | (static_cast<uint32_t>(tag) & 0xFFFF0000u);
+                m_ipu.inputChainStarted = true;
+                m_ipu.inputChainEndPending =
+                    id == 0u || id == 7u || (tie && (tag & 0x80000000u) != 0u);
+                ++tags;
+
+                if (tags <= 8u)
+                {
+                    std::cerr << "[probe:ipu-tag] n=" << tags
+                              << " id=" << id << " qwc=0x" << std::hex << qwc
+                              << " madr=0x" << madr << " next=0x" << tagAddr
+                              << std::dec << '\n';
+                }
+
+                if (qwc == 0u && (id == 0u || id == 7u || (tie && (tag & 0x80000000u))))
+                {
+                    transferEnded = true;
+                    break;
+                }
+            }
+
+            const uint32_t moved = appendQwords(madr, qwc);
+            if (moved == 0u)
+                break;
+            madr += moved * 16u;
+            qwc -= moved;
+        }
+        m_ioRegisters[channelBase + 0x30u] = tagAddr;
+        m_ioRegisters[channelBase + 0x40u] = asr0;
+        m_ioRegisters[channelBase + 0x50u] = asr1;
+        static std::atomic<uint32_t> chainLog{0u};
+        if (chainLog.fetch_add(1u, std::memory_order_relaxed) < 32u)
+            std::cerr << "[probe:ipu-chain] tags=" << tags
+                      << " qwc=" << qwc << " words=" << m_ipu.inFifo.size()
+                      << " ended=" << transferEnded << '\n';
+        chcr = (chcr & ~(0x3u << 4u)) | ((asp & 0x3u) << 4u);
+        if (transferEnded)
+        {
+            m_ipu.inputChainStarted = false;
+            m_ipu.inputChainEndPending = false;
+        }
+    }
+    else
+    {
+        static std::atomic<uint32_t> chainWarn{0u};
+        if (chainWarn.fetch_add(1u, std::memory_order_relaxed) < 4u)
+            std::cerr << "[probe:ipu-dma] unsupported mode=" << mode << '\n';
+        qwc = 0u;
+    }
+    m_ioRegisters[channelBase + 0x10u] = madr;
+    m_ioRegisters[channelBase + 0x20u] = qwc;
+    if (mode == 0u ? qwc == 0u : transferEnded)
+        chcr &= ~0x100u;
+    m_ioRegisters[channelBase + 0x00u] = chcr;
+}
+
+void PS2Memory::fillIpuOutFifo()
+{
+    while (m_ipu.bdecWordsLeft != 0u && m_ipu.outFifo.size() < IpuState::kFifoWords)
+    {
+        m_ipu.outFifo.push_back(m_ipu.bdecOutput[m_ipu.bdecOutputPos++]);
+        --m_ipu.bdecWordsLeft;
+    }
+}
+
+void PS2Memory::runIpuOutDma(uint32_t channelBase)
+{
+    uint32_t madr = m_ioRegisters[channelBase + 0x10u];
+    uint32_t qwc = m_ioRegisters[channelBase + 0x20u];
+    const uint32_t chcr = m_ioRegisters[channelBase + 0x00u];
+    static std::atomic<uint32_t> outDmaProbes{0u};
+    const uint32_t outDmaProbe = outDmaProbes.fetch_add(1u, std::memory_order_relaxed);
+    if (outDmaProbe < 12u)
+        std::cerr << "[probe:ipu-outdma-start] n=" << outDmaProbe
+                  << " madr=0x" << std::hex << madr << " qwc=0x" << qwc
+                  << " words=0x" << m_ipu.outFifo.size()
+                  << " first=0x" << (m_ipu.outFifo.empty() ? 0u : m_ipu.outFifo.front())
+                  << std::dec << '\n';
+    const uint32_t mode = (chcr >> 2) & 0x3u;
+    if (mode != 0u)
+    {
+        static std::atomic<uint32_t> chainWarn{0u};
+        if (chainWarn.fetch_add(1u, std::memory_order_relaxed) < 4u)
+            std::cerr << "[probe:ipu-dma] chain mode on 0x" << std::hex << channelBase << std::dec << '\n';
+        m_ioRegisters[channelBase + 0x00u] = chcr & ~0x100u;
+        return;
+    }
+    while (qwc != 0u)
+    {
+        // A decoded macroblock is larger than the eight-qword hardware FIFO.
+        // Refill it as DMA drains, until this macroblock is fully emitted.
+        fillIpuOutFifo();
+        // DMA transfers complete 16-byte quadwords. CSC may produce pixels
+        // one word at a time; do not count an incomplete quadword as sent.
+        if (m_ipu.outFifo.size() < 4u)
+            break;
+        const bool scratch = (madr & 0x80000000u) != 0u || isScratchpad(madr);
+        uint32_t phys = 0u;
+        try
+        {
+            phys = scratch ? (madr & 0x3FF0u) : translateAddress(madr);
+        }
+        catch (const std::exception &)
+        {
+            break;
+        }
+        uint8_t *base = scratch ? m_scratchpad : m_rdram;
+        const uint32_t limit = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+        if (phys + 16u > limit)
+            break;
+        for (uint32_t i = 0u; i < 4u; ++i)
+        {
+            const uint32_t w = m_ipu.outFifo.front();
+            m_ipu.outFifo.pop_front();
+            std::memcpy(base + phys + i * 4u, &w, sizeof(w));
+        }
+        madr += 16u;
+        --qwc;
+    }
+    // If the programmed DMA size ended mid-macroblock, retain the remainder
+    // in the output FIFO for the next OUT transfer.
+    fillIpuOutFifo();
+    m_ioRegisters[channelBase + 0x10u] = madr;
+    m_ioRegisters[channelBase + 0x20u] = qwc;
+    if (qwc == 0u)
+        m_ioRegisters[channelBase + 0x00u] = chcr & ~0x100u;
+}
+
+void PS2Memory::resumeIpuOutDma()
+{
+    fillIpuOutFifo();
+    const uint32_t chcr = m_ioRegisters[0x1000B000u];
+    if ((chcr & 0x100u) != 0u && !m_ipu.outFifo.empty())
+        runIpuOutDma(0x1000B000u);
 }
 
 void PS2Memory::write32(uint32_t address, uint32_t value)
@@ -1093,6 +2042,27 @@ void PS2Memory::write128(uint32_t address, __m128i value)
         processVIF1Data(fifoData, sizeof(fifoData));
         return;
     }
+    // 128-bit stores to IPU_CMD feed the input FIFO (hardware behavior);
+    // only 32-bit stores are commands.
+    if (physAddr == 0x10002000u)
+    {
+        alignas(16) uint32_t words[4];
+        _mm_store_si128(reinterpret_cast<__m128i *>(words), value);
+        for (uint32_t i = 0u; i < 4u; ++i)
+        {
+            if (m_ipu.inFifo.size() < IpuState::kFifoWords)
+                m_ipu.inFifo.push_back(words[i]);
+        }
+        static std::atomic<uint32_t> directCount{0u};
+        const uint32_t n = directCount.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 8u)
+        {
+            std::cerr << "[probe:ipu-direct] n=" << n
+                      << " inQw=0x" << std::hex << m_ipu.inFifo.size() / 4u
+                      << std::dec << '\n';
+        }
+        return;
+    }
 
     if (scratch)
     {
@@ -1200,15 +2170,35 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             std::cerr << "[probe:ipu-write] addr=0x" << std::hex << address
                       << " value=0x" << value << std::dec << '\n';
         }
-        if (address == 0x10002010)
+        if (address == 0x10002000u)
         {
-            m_ioRegisters[address] = value & ~(1u << 31);
-            if (value & (1u << 30))
+            writeIpuCommand(value);
+        }
+        else if (address == 0x10002010u)
+        {
+            // CTRL write mask mirrors hardware (PCSX2 formula): only the
+            // setup field is settable, status bits (IFC/OFC/CBP/ECD/SCD)
+            // are read-only. RST (bit 30) resets the FIFOs/bit pointer.
+            const bool reset = (value & (1u << 30u)) != 0u;
+            // RST is a write trigger, not persistent state. Hardware clears
+            // it during soft reset; exposing it on the next CTRL read makes
+            // guest read-modify-write sequences reset the IPU forever.
+            m_ipu.ctrlKeep = value & 0x07F30000u;
+            if (reset)
             {
-                m_ioRegisters[0x10002000] = 0;
-                m_ioRegisters[0x10002020] = 0;
-                m_ioRegisters[0x10002030] = 0;
+                m_ipu.inFifo.clear();
+                m_ipu.outFifo.clear();
+                m_ipu.bitPos = 0u;
+                m_ipu.fragBits = 0u;
+                m_ipu.busy = false;
+                m_ipu.scd = false;
+                m_ipu.bdecWordsLeft = 0u;
+                m_ipu.bdecOutputPos = 0u;
+                m_ipu.codedBlockPattern = 0u;
+                m_ipu.sawSliceCode = false;
+                m_ipu.mpeg2.reset();
             }
+            syncIpuCmdMirror();
         }
         else
         {
@@ -1331,7 +2321,111 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 return true;
             }
 
-            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
+            // IPU FIFO channels run synchronously: the guest polls QWC/STR,
+            // so completing inline keeps stream flow without interrupts.
+            if (channelBase == 0x1000B000u)
+            {
+                runIpuOutDma(channelBase);
+            }
+            else if (channelBase == 0x1000B400u)
+            {
+                runIpuInDma(channelBase);
+            }
+
+            if (channelBase == 0x1000D000u || channelBase == 0x1000D400u)
+            {
+                const bool toSpr = channelBase == 0x1000D400u;
+                uint32_t memoryAddr = madr;
+                uint32_t sprAddr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
+                uint32_t remaining = qwc & 0xFFFFu;
+                uint32_t tagAddr = tadr;
+                const uint32_t mode = (value >> 2u) & 3u;
+                auto transfer = [&](uint32_t count) {
+                    for (uint32_t i = 0; i < count; ++i)
+                    {
+                        const uint32_t phys = translateAddress(memoryAddr);
+                        inRange(phys, 16u, PS2_RAM_SIZE, "SPR DMA", memoryAddr);
+                        if (toSpr)
+                            std::memcpy(m_scratchpad + sprAddr, m_rdram + phys, 16u);
+                        else
+                            std::memcpy(m_rdram + phys, m_scratchpad + sprAddr, 16u);
+                        memoryAddr += 16u;
+                        sprAddr = (sprAddr + 16u) & 0x3FFFu;
+                    }
+                };
+                if (mode == 0u)
+                    transfer(remaining);
+                else if (mode == 2u)
+                {
+                    const uint32_t sqwc = m_ioRegisters[0x1000E030u];
+                    const uint32_t block = (sqwc >> 16u) & 0xFFu;
+                    while (remaining != 0u)
+                    {
+                        const uint32_t count = block ? std::min(block, remaining) : remaining;
+                        transfer(count);
+                        memoryAddr += (sqwc & 0xFFu) * 16u;
+                        remaining -= count;
+                    }
+                }
+                else if (mode == 1u && toSpr)
+                {
+                    transfer(remaining);
+                    bool done = false;
+                    uint32_t asp = (value >> 4u) & 3u;
+                    for (uint32_t tags = 0u; !done && tags < 65536u; ++tags)
+                    {
+                        const uint32_t phys = translateAddress(tagAddr);
+                        const uint64_t tag = loadScalar<uint64_t>(m_rdram, phys, PS2_RAM_SIZE, "SPR DMA tag", tagAddr);
+                        const uint32_t id = static_cast<uint32_t>(tag >> 28u) & 7u;
+                        const uint32_t count = static_cast<uint32_t>(tag) & 0xFFFFu;
+                        const uint32_t target = static_cast<uint32_t>(tag >> 32u) & 0x7FFFFFF0u;
+                        const uint32_t next = tagAddr + 16u;
+                        memoryAddr = next;
+                        tagAddr = next + count * 16u;
+                        switch (id)
+                        {
+                        case 0u: memoryAddr = target; tagAddr = next; done = true; break;
+                        case 1u: break;
+                        case 2u: tagAddr = target; break;
+                        case 3u:
+                        case 4u: memoryAddr = target; tagAddr = next; break;
+                        case 5u:
+                            if (asp >= 2u) throw std::runtime_error("SPR DMA CALL stack overflow");
+                            m_ioRegisters[channelBase + 0x40u + asp * 16u] = tagAddr;
+                            ++asp;
+                            tagAddr = target;
+                            break;
+                        case 6u:
+                            if (asp == 0u) done = true;
+                            else tagAddr = m_ioRegisters[channelBase + 0x40u + --asp * 16u];
+                            break;
+                        case 7u: done = true; break;
+                        }
+                        transfer(count);
+                        if ((value & 0x80u) && (tag & 0x80000000u)) done = true;
+                        m_ioRegisters[channelBase] = (value & 0xFFFFu & ~0x30u) |
+                            (asp << 4u) | (static_cast<uint32_t>(tag) & 0xFFFF0000u);
+                    }
+                    if (!done) throw std::runtime_error("SPR DMA chain exceeds tag limit");
+                }
+                else
+                    throw std::runtime_error("Unsupported SPR DMA transfer mode");
+
+                m_ioRegisters[channelBase + 0x10u] = memoryAddr;
+                m_ioRegisters[channelBase + 0x20u] = 0u;
+                m_ioRegisters[channelBase + 0x30u] = tagAddr;
+                m_ioRegisters[channelBase + 0x80u] = sprAddr;
+                m_ioRegisters[channelBase] &= ~0x100u;
+                m_ioRegisters[0x1000E010u] |= 1u << (toSpr ? 9u : 8u);
+                static uint32_t sprProbes = 0u;
+                if (sprProbes++ < 16u)
+                    std::cerr << "[probe:spr-dma] ch=0x" << std::hex << channelBase
+                              << " mode=" << mode << " madr=0x" << madr << " end=0x" << memoryAddr
+                              << " sadr=0x" << sprAddr << std::dec << '\n';
+            }
+
+            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) &&
+                (m_gsVRAM || channelBase == 0x10008000u))
             {
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
                 {
@@ -2396,17 +3490,22 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     if (address >= 0x10002000 && address <= 0x10002030)
     {
         uint32_t val = 0;
+        observeIpuRead();
         switch (address)
         {
         case 0x10002000:
-            val = m_ioRegisters[address];
+            val = m_ipu.cmdData;
             break;
         case 0x10002010:
-            val = m_ioRegisters[address] & ~(1u << 31);
+            val = readIpuCtrl();
             break;
         case 0x10002020:
+            val = readIpuBp();
+            break;
         case 0x10002030:
-            val = m_ioRegisters[address];
+            // FDEC/VDEC publish the same look-ahead word through TOP.  The
+            // Katamari stream parser reads TOP after CMD completion.
+            val = m_ipu.topData;
             break;
         default:
             val = 0;
@@ -2437,6 +3536,11 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         {
             if ((address & 0xFF) == 0x00)
             {
+                // IPU DMA remains active while a FIFO temporarily blocks the
+                // transfer.  Merely polling CHCR must not acknowledge/finish
+                // it; runIpuInDma/runIpuOutDma clear STR at the real end.
+                if (address == 0x1000B000u || address == 0x1000B400u)
+                    return m_ioRegisters[address];
                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
                 m_ioRegisters[address] = channelStatus;
                 return channelStatus;

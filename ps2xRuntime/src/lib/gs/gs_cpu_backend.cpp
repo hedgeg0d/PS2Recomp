@@ -9,6 +9,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -1904,6 +1905,31 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
 {
     PresentationFrame result{};
     static uint32_t presentationLogCount = 0u;
+    auto dumpFrame = [](const PresentationFrame &frame)
+    {
+        static uint64_t frameCount = 0u;
+        const uint64_t index = ++frameCount;
+        const char *directory = std::getenv("PS2X_FRAME_DUMP_DIR");
+        const char *intervalText = std::getenv("PS2X_FRAME_DUMP_INTERVAL");
+        const uint64_t interval = intervalText ? std::max<uint64_t>(1u, std::strtoull(intervalText, nullptr, 10)) : 300u;
+        if (!directory || !*directory || (index % interval) != 0u ||
+            frame.pixels.empty() || frame.width == 0u || frame.height == 0u)
+        {
+            return;
+        }
+        const std::string path = std::string(directory) + "/frame-" + std::to_string(index) + ".ppm";
+        std::ofstream output(path, std::ios::binary);
+        if (!output)
+            return;
+        output << "P6\n" << frame.width << ' ' << frame.height << "\n255\n";
+        for (uint32_t y = 0u; y < frame.height; ++y)
+            for (uint32_t x = 0u; x < frame.width; ++x)
+            {
+                const uint8_t *pixel = frame.pixels.data() +
+                                       (static_cast<size_t>(y) * kHostFrameWidth + x) * 4u;
+                output.write(reinterpret_cast<const char *>(pixel), 3);
+            }
+    };
     const GSPmodeState pmode = decodePmode(request.pmode);
     const GSSmode2State smode2 = decodeSMode2(request.smode2);
     const bool fieldMode = smode2.interlaced && !smode2.frameMode;
@@ -2023,6 +2049,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                           << " fbp1=" << displayFrame1.fbp << " fbp2=" << displayFrame2.fbp
                           << " src1=" << selected1.fbp << " nonblack=" << std::dec
                           << countNonBlackPixels(result.pixels, result.width, result.height) << std::endl;
+            dumpFrame(result);
             return result;
         }
     }
@@ -2045,5 +2072,6 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                   << " width=" << std::dec << result.width << " height=" << result.height
                   << " nonblack=" << countNonBlackPixels(result.pixels, result.width, result.height)
                   << std::endl;
+    dumpFrame(result);
     return result;
 }
