@@ -901,9 +901,14 @@ namespace ps2recomp
             }
 
             m_reporter.progress("parsing ELF");
+            if (!m_config.discoverFunctions && m_config.ghidraMapPath.empty())
+            {
+                m_reporter.error("config", "discover_functions=false requires ghidra_output");
+                return false;
+            }
             m_elfParser = std::make_unique<ElfParser>(m_config.inputPath);
             m_elfParser->setReporter(&m_reporter);
-            if (!m_elfParser->parse())
+            if (!m_elfParser->parse(m_config.discoverFunctions))
             {
                 m_reporter.error("elf", "Failed to parse ELF file: " + m_config.inputPath);
                 return false;
@@ -911,7 +916,11 @@ namespace ps2recomp
 
             if (!m_config.ghidraMapPath.empty())
             {
-                m_elfParser->loadGhidraFunctionMap(m_config.ghidraMapPath);
+                if (!m_elfParser->loadGhidraFunctionMap(m_config.ghidraMapPath) && !m_config.discoverFunctions)
+                {
+                    m_reporter.error("config", "Explicit-map mode requires a valid function map");
+                    return false;
+                }
             }
 
             m_functions = m_elfParser->extractFunctions();

@@ -178,6 +178,7 @@ namespace ps2recomp
         std::string inputPath;
         std::string outputPath;
         std::string ghidraMapPath;
+        bool discoverFunctions = true;
         bool singleFileOutput = false;
         bool lowMemoryMode = false;
         uint32_t outputWorkerThreads = 0;

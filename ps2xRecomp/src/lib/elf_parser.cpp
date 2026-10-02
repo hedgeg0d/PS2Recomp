@@ -2585,7 +2585,7 @@ namespace ps2recomp
 
     ElfParser::~ElfParser() = default;
 
-    bool ElfParser::parse()
+    bool ElfParser::parse(bool discoverFunctions)
     {
         if (!m_elf->load(m_filePath))
         {
@@ -2609,7 +2609,7 @@ namespace ps2recomp
         loadSections();
         loadSymbols();
         loadRelocations();
-        loadDebugFunctions();
+        loadDebugFunctions(discoverFunctions);
 
         return true;
     }
@@ -2805,7 +2805,7 @@ namespace ps2recomp
         }
     }
 
-    void ElfParser::loadDebugFunctions()
+    void ElfParser::loadDebugFunctions(bool discoverFunctions)
     {
         m_extraFunctions.clear();
         m_hasLoadedGhidraMap = false;
@@ -2878,10 +2878,13 @@ namespace ps2recomp
             }
         }
 
-        // DWARF in retail ELFs is often partial.
-        ScanFunctionStartsFallback(this, m_extraFunctions);
-
-        ScanDirectBranchTargets(this, m_extraFunctions);
+        // A supplied authoritative map can avoid expensive heuristic scans.
+        // Symbol/DWARF loading is unchanged; discovery remains on by default.
+        if (discoverFunctions)
+        {
+            ScanFunctionStartsFallback(this, m_extraFunctions);
+            ScanDirectBranchTargets(this, m_extraFunctions);
+        }
 
         std::sort(m_extraFunctions.begin(), m_extraFunctions.end(),
                   [](const Function &a, const Function &b)

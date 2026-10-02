@@ -22,7 +22,7 @@ namespace ps2recomp
                 explicit ElfParser(const std::string &filePath);
                 ~ElfParser();
 
-                bool parse();
+                bool parse(bool discoverFunctions = true);
 
                 bool loadGhidraFunctionMap(const std::string &mapPath);
                 std::vector<Function> extractFunctions() const;
@@ -56,7 +56,7 @@ namespace ps2recomp
                 void loadSections();
                 void loadSymbols();
                 void loadRelocations();
-                void loadDebugFunctions();
+                void loadDebugFunctions(bool discoverFunctions);
                 bool isExecutableSection(const ELFIO::section *section) const;
                 bool isDataSection(const ELFIO::section *section) const;
         };

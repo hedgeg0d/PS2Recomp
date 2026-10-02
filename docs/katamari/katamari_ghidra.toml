@@ -11,6 +11,8 @@
 input = "SLUS_210.08"
 output = "output"
 ghidra_output = "katamari_patched.csv"
+# Skip heuristic discovery before loading this explicit map.
+discover_functions = false
 single_file_output = false
 patch_syscalls = false
 patch_cop0 = true
@@ -40,6 +42,8 @@ instructions = [
 ]
 
 [ghidra_export]
+# Historical exporter statistics, before continuation/gap-fill entries.
+# The checked-in CSV is the authoritative current function map.
 function_count = 3288
 code_label_count = 0
 csv_record_count = 3288

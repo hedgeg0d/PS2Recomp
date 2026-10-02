@@ -39,6 +39,7 @@ namespace ps2recomp
 
             config.inputPath = toml::find<std::string>(general, "input");
             config.ghidraMapPath = toml::find_or<std::string>(general, "ghidra_output", "");
+            config.discoverFunctions = toml::find_or<bool>(general, "discover_functions", true);
             config.outputPath = toml::find<std::string>(general, "output");
             config.singleFileOutput = toml::find_or<bool>(general, "single_file_output", false);
             config.lowMemoryMode = toml::find_or<bool>(general, "low_memory_mode", config.lowMemoryMode);
@@ -288,6 +289,7 @@ namespace ps2recomp
         toml::table general;
         general["input"] = config.inputPath;
         general["ghidra_output"] = config.ghidraMapPath;
+        general["discover_functions"] = config.discoverFunctions;
         general["output"] = config.outputPath;
         general["single_file_output"] = config.singleFileOutput;
         general["low_memory_mode"] = config.lowMemoryMode;
