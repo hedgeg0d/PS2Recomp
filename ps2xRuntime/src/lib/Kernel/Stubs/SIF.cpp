@@ -2,14 +2,13 @@
 #include "SIF.h"
 #include "../Syscalls/RPC.h"
 #include "../../ps2_iop_transport.h"
-#include "runtime/ee_scheduler.h"
 #include "runtime/ps2_address.h"
+#include "runtime/ee_scheduler.h"
 
 #include <algorithm>
-#include <iostream>
+#include <cstring>
 #include <limits>
 #include <map>
-#include <unordered_map>
 #include <vector>
 
 namespace ps2_stubs
@@ -27,23 +26,27 @@ namespace ps2_stubs
     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t srcAddr = getRegU32(ctx, 7); // $a3
-        // The EE calling convention provides the fifth and sixth integer
-        // arguments in $t0/$t1.  They are not o32 stack arguments: the
-        // caller-reserved stack area starts only after the eight-register
-        // argument window has been exhausted.
-        const uint32_t dstAddr = getRegU32(ctx, 8); // $t0
-        const uint32_t size = getRegU32(ctx, 9);    // $t1
+        // EE passes the fifth and sixth integer arguments in $t0/$t1.
+        const uint32_t dstAddr = getRegU32(ctx, 8);
+        const uint32_t size = getRegU32(ctx, 9);
         if (size != 0u && srcAddr != 0u && dstAddr != 0u)
         {
+            std::vector<uint8_t> payload(size);
+            bool valid = runtime != nullptr;
             for (uint32_t i = 0; i < size; ++i)
             {
                 const uint8_t *src = getConstMemPtr(rdram, srcAddr + i);
-                uint8_t *dst = getMemPtr(rdram, dstAddr + i);
-                if (!src || !dst)
+                if (!src)
                 {
+                    valid = false;
                     break;
                 }
-                *dst = *src;
+                payload[i] = *src;
+            }
+            if (!valid || !runtime->writeIopMemory(dstAddr, payload.data(), payload.size()))
+            {
+                setReturnS32(ctx, 0);
+                return;
             }
         }
 
@@ -52,6 +55,13 @@ namespace ps2_stubs
 
     namespace
     {
+        // Virtual buffers used only by the legacy HLE raw-RPC transport.
+        // They never alias either physical EE RAM or the new physical IOP RAM.
+        constexpr uint32_t kIopHeapBase = 0x04000000u;
+        constexpr uint32_t kIopHeapLimit = 0x04500000u;
+        constexpr uint32_t kIopHeapAlign = 64u;
+        uint32_t g_iopHeapNext = kIopHeapBase;
+
         struct Ps2SifDmaTransfer
         {
             uint32_t src = 0;
@@ -74,7 +84,8 @@ namespace ps2_stubs
         std::mutex g_sifHeapMutex;
         std::unordered_map<uint32_t, uint32_t> g_sifRegs;
         std::unordered_map<uint32_t, uint32_t> g_sifSregs;
-        std::unordered_map<uint32_t, uint32_t> g_sifCmdHandlers;
+        struct SifCmdHandler { uint32_t function = 0u; uint32_t argument = 0u; };
+        std::unordered_map<uint32_t, SifCmdHandler> g_sifCmdHandlers;
         std::unordered_map<PS2Runtime *, std::unordered_map<uint32_t, RawSifRpcBinding>> g_sifRawRpcBindings;
         std::map<uint32_t, uint32_t> g_sifHeapAllocations;
         std::array<uint8_t, kIopHeapLimit - kIopHeapBase> g_sifHeapStorage{};
@@ -377,24 +388,6 @@ namespace ps2_stubs
 
         bool writeGuestBytes(uint8_t *rdram, uint32_t address, const void *source, size_t size)
         {
-            // TEMP-EXPERIMENT: catch DMA-side d0 writer. Revert.
-            if (size != 0u && address < 0x5611E0u && address + size > 0x5611C0u)
-            {
-                static int sifw = 0;
-                if (sifw < 20)
-                {
-                    ++sifw;
-                    const uint8_t *b = static_cast<const uint8_t *>(source);
-                    std::fprintf(stderr,
-                                 "[sifw] addr=0x%08x size=0x%zx data=%02x%02x%02x%02x\n",
-                                 address,
-                                 size,
-                                 size > 0 ? b[0] : 0,
-                                 size > 1 ? b[1] : 0,
-                                 size > 2 ? b[2] : 0,
-                                 size > 3 ? b[3] : 0);
-                }
-            }
             if ((!source && size != 0u) || !rdram)
             {
                 return false;
@@ -1059,7 +1052,63 @@ namespace ps2_stubs
             }
             return true;
         }
+            bool canAccessEeRange(const uint8_t *rdram, uint32_t address, uint32_t sizeBytes)
+        {
+            if (!rdram)
+            {
+                return false;
+            }
+            if (sizeBytes == 0u)
+            {
+                return true;
+            }
+            if (sizeBytes - 1u > std::numeric_limits<uint32_t>::max() - address)
+            {
+                return false;
+            }
+            for (uint32_t i = 0u; i < sizeBytes; ++i)
+            {
+                const uint32_t byteAddress = address + i;
+                if (!isCopyableGuestAddress(byteAddress) || getConstMemPtr(rdram, byteAddress) == nullptr)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool readEeRange(const uint8_t *rdram, uint32_t address, void *destination, uint32_t sizeBytes)
+        {
+            if ((!destination && sizeBytes != 0u) || !canAccessEeRange(rdram, address, sizeBytes))
+                return false;
+            auto *bytes = static_cast<uint8_t *>(destination);
+            for (uint32_t i = 0u; i < sizeBytes; ++i)
+            {
+                const uint8_t *source = getConstMemPtr(rdram, address + i);
+                if (!source)
+                    return false;
+                bytes[i] = *source;
+            }
+            return true;
+        }
+
+        bool writeEeRange(uint8_t *rdram, uint32_t address, const void *source, uint32_t sizeBytes)
+        {
+            if ((!source && sizeBytes != 0u) || !canAccessEeRange(rdram, address, sizeBytes))
+                return false;
+            ps2TraceGuestRangeWrite(rdram, address, sizeBytes, "SIF IOP-to-EE DMA", nullptr);
+            const auto *bytes = static_cast<const uint8_t *>(source);
+            for (uint32_t i = 0u; i < sizeBytes; ++i)
+            {
+                uint8_t *destination = getMemPtr(rdram, address + i);
+                if (!destination)
+                    return false;
+                *destination = bytes[i];
+            }
+            return true;
+        }
     }
+
 
     bool isSifIopHeapAddress(uint32_t address)
     {
@@ -1136,14 +1185,6 @@ namespace ps2_stubs
         return true;
     }
 
-    void resetSifState()
-    {
-        releaseRawSifRpcBindings(nullptr);
-        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-        seedDefaultSifRegsLocked();
-        resetSifHeapState();
-    }
-
     void resetSifRuntimeState(PS2Runtime *runtime)
     {
         releaseRawSifRpcBindings(runtime);
@@ -1152,31 +1193,99 @@ namespace ps2_stubs
         g_sifBootEndPending = false;
     }
 
+    void resetSifState()
+    {
+        releaseRawSifRpcBindings(nullptr);
+        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+        seedDefaultSifRegsLocked();
+        resetSifHeapState();
+    }
+
+    bool dispatchSifCommand(uint8_t *rdram,
+                            PS2Runtime *runtime,
+                            uint32_t commandId,
+                            const void *packet,
+                            size_t packetSize) noexcept
+    {
+        if (!rdram || !runtime || !packet || packetSize < 16u || packetSize > 112u)
+            return false;
+
+        SifCmdHandler registered{};
+        {
+            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+            const auto handler = g_sifCmdHandlers.find(commandId);
+            if (handler == g_sifCmdHandlers.end() || handler->second.function == 0u)
+                return false;
+            registered = handler->second;
+        }
+
+        if (!runtime->hasFunction(registered.function))
+            return false;
+
+        const uint32_t packetAddress = runtime->guestMalloc(static_cast<uint32_t>(packetSize), 16u);
+        if (packetAddress == 0u)
+            return false;
+
+        uint8_t *const first = getMemPtr(rdram, packetAddress);
+        uint8_t *const last = getMemPtr(rdram, packetAddress + static_cast<uint32_t>(packetSize - 1u));
+        if (!first || !last || last < first || static_cast<size_t>(last - first) != packetSize - 1u)
+        {
+            runtime->guestFree(packetAddress);
+            return false;
+        }
+
+        ps2TraceGuestRangeWrite(rdram, packetAddress, static_cast<uint32_t>(packetSize), "SIF command packet", nullptr);
+        std::memcpy(first, packet, packetSize);
+
+        try
+        {
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::SifCommand;
+            invocation.tag = commandId;
+            invocation.context = runtime->cpu();
+            invocation.context.pc = registered.function;
+            SET_GPR_U32(&invocation.context, 4, packetAddress);
+            SET_GPR_U32(&invocation.context, 5, registered.argument);
+            SET_GPR_U32(&invocation.context, 6, 0u);
+            SET_GPR_U32(&invocation.context, 7, 0u);
+            SET_GPR_U32(&invocation.context, 29, 0u);
+            SET_GPR_U32(&invocation.context, 31, 0u);
+            invocation.onComplete = [runtime, packetAddress](const R5900Context &, R5900Context &)
+            {
+                runtime->guestFree(packetAddress);
+            };
+            runtime->eeScheduler().queueInvocation(std::move(invocation));
+            return true;
+        }
+        catch (...)
+        {
+            runtime->guestFree(packetAddress);
+            return false;
+        }
+    }
+
     void sceSifAddCmdHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t cid = getRegU32(ctx, 4);
         const uint32_t handler = getRegU32(ctx, 5);
+        const uint32_t argument = getRegU32(ctx, 6);
         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-        g_sifCmdHandlers[cid] = handler;
+        g_sifCmdHandlers[cid] = SifCmdHandler{handler, argument};
         setReturnS32(ctx, 0);
     }
 
     void sceSifAllocIopHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        (void)runtime;
-
         const uint32_t reqSize = getRegU32(ctx, 4);
-        setReturnU32(ctx, allocateSifHeapBlock(reqSize));
+        setReturnU32(ctx, runtime ? runtime->allocateIopMemory(reqSize, 64u) : 0u);
     }
 
     void sceSifAllocSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        (void)runtime;
-
         const uint32_t size = getRegU32(ctx, 5);
-        setReturnU32(ctx, allocateSifHeapBlock(size));
+        setReturnU32(ctx, runtime ? runtime->allocateIopMemory(size, 64u) : 0u);
     }
 
     void sceSifBindRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1222,19 +1331,15 @@ namespace ps2_stubs
     void sceSifFreeIopHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        (void)runtime;
-
         const uint32_t addr = getRegU32(ctx, 4);
-        setReturnS32(ctx, freeSifHeapBlock(addr) ? 0 : -1);
+        setReturnS32(ctx, runtime && runtime->freeIopMemory(addr) ? 0 : -1);
     }
 
     void sceSifFreeSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        (void)runtime;
-
         const uint32_t addr = getRegU32(ctx, 4);
-        setReturnS32(ctx, freeSifHeapBlock(addr) ? 0 : -1);
+        setReturnS32(ctx, runtime && runtime->freeIopMemory(addr) ? 0 : -1);
     }
 
     void sceSifGetDataTable(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1283,15 +1388,21 @@ namespace ps2_stubs
         if (runtime)
         {
             PS2IopTransport::notifyTransfer(runtime, rdram, {
-                ps2x::iop::SifTransferKind::GetOtherData,
-                ps2x::iop::SifTransferPhase::BeforeCopy,
-                srcAddr,
-                dstAddr,
-                size,
-            });
+                                                                ps2x::iop::SifTransferKind::GetOtherData,
+                                                                ps2x::iop::SifTransferPhase::BeforeCopy,
+                                                                srcAddr,
+                                                                dstAddr,
+                                                                size,
+                                                            });
         }
 
-        if (!copyGuestByteRange(rdram, dstAddr, srcAddr, size))
+        std::vector<uint8_t> payload(size);
+        const bool sourceRead = isSifIopHeapAddress(srcAddr)
+                                    ? readSifIopHeap(srcAddr, payload.data(), payload.size())
+                                    : runtime && runtime->isIopMemoryRange(srcAddr, size) &&
+                                      runtime->readIopMemory(srcAddr, payload.data(), payload.size());
+        if (!sourceRead || !canAccessEeRange(rdram, dstAddr, size) ||
+            !writeEeRange(rdram, dstAddr, payload.data(), size))
         {
             static uint32_t warnCount = 0;
             if (warnCount < 32u)
@@ -1319,12 +1430,12 @@ namespace ps2_stubs
         if (runtime)
         {
             PS2IopTransport::notifyTransfer(runtime, rdram, {
-                ps2x::iop::SifTransferKind::GetOtherData,
-                ps2x::iop::SifTransferPhase::AfterCopy,
-                srcAddr,
-                dstAddr,
-                size,
-            });
+                                                                ps2x::iop::SifTransferKind::GetOtherData,
+                                                                ps2x::iop::SifTransferPhase::AfterCopy,
+                                                                srcAddr,
+                                                                dstAddr,
+                                                                size,
+                                                            });
         }
 
         setReturnS32(ctx, 0);
@@ -1393,7 +1504,7 @@ namespace ps2_stubs
 
     void sceSifInitIopHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        resetSifHeapState();
+        // The physical IOP allocator is initialized by IopSubsystem::reset().
         setReturnS32(ctx, 0);
     }
 
@@ -1434,6 +1545,7 @@ namespace ps2_stubs
 
     void sceSifRebootIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        PS2IopTransport::reset(runtime);
         setReturnS32(ctx, 1);
     }
 
@@ -1462,7 +1574,6 @@ namespace ps2_stubs
 
     void sceSifResetIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
         PS2IopTransport::reset(runtime);
         setReturnS32(ctx, 1);
     }
@@ -1507,27 +1618,6 @@ namespace ps2_stubs
         const uint32_t count = getRegU32(ctx, 5);
 
         const uint32_t listAddr = getRegU32(ctx, 4);
-        // TEMP-EXPERIMENT: log SIF DMA senders to find libmc's packet builder. Revert.
-        {
-            static int dmaCount = 0;
-            if (dmaCount < 300 && dmatAddr != 0u && count > 0u && count <= 32u)
-            {
-                ++dmaCount;
-                const uint8_t *e0 = getConstMemPtr(rdram, dmatAddr);
-                uint32_t src = 0, dst = 0, size = 0, attr = 0;
-                if (e0)
-                {
-                    std::memcpy(&src, e0, 4); std::memcpy(&dst, e0 + 4, 4);
-                    std::memcpy(&size, e0 + 8, 4); std::memcpy(&attr, e0 + 12, 4);
-                }
-                std::cerr << "[sifdma] n=" << std::dec << dmaCount
-                          << " pc=0x" << std::hex << ctx->pc
-                          << " ra=0x" << getRegU32(ctx, 31)
-                          << " src=0x" << (src & 0x1FFFFFFF) << " dst=0x" << (dst & 0x1FFFFFFF)
-                          << " size=0x" << size << " attr=0x" << attr
-                          << std::dec << std::endl;
-            }
-        }
         PS2_IF_AGRESSIVE_LOGS({
             std::cerr << "[sceSifSetDma:CALL] pc=0x" << std::hex << ctx->pc
                       << " ra=0x" << getRegU32(ctx, 31)
@@ -1586,9 +1676,11 @@ namespace ps2_stubs
                 ok = false;
                 break;
             }
-            const bool validTransfer = xfer.dest == 0u
-                                           ? canCopyAddressRange(rdram, xfer.src, sizeBytes)
-                                           : canCopyGuestByteRange(rdram, xfer.dest, xfer.src, sizeBytes);
+            const bool virtualDestination = isSifIopHeapAddress(xfer.dest);
+            const bool validTransfer = canAccessEeRange(rdram, xfer.src, sizeBytes) &&
+                (xfer.dest == 0u ||
+                 (virtualDestination ? isSifIopHeapRange(xfer.dest, sizeBytes)
+                                     : runtime && runtime->isIopMemoryRange(xfer.dest, sizeBytes)));
             if (!validTransfer)
             {
                 ok = false;
@@ -1613,11 +1705,19 @@ namespace ps2_stubs
                         static_cast<uint32_t>(xfer.size),
                     });
                 }
-                if (xfer.dest != 0u &&
-                    !copyGuestByteRange(rdram, xfer.dest, xfer.src, static_cast<uint32_t>(xfer.size)))
+                if (xfer.dest != 0u)
                 {
-                    ok = false;
-                    break;
+                    const uint32_t sizeBytes = static_cast<uint32_t>(xfer.size);
+                    std::vector<uint8_t> payload(sizeBytes);
+                    const bool copied = readEeRange(rdram, xfer.src, payload.data(), sizeBytes) &&
+                        (isSifIopHeapAddress(xfer.dest)
+                            ? writeSifIopHeap(xfer.dest, payload.data(), sizeBytes)
+                            : runtime->writeIopMemory(xfer.dest, payload.data(), sizeBytes));
+                    if (!copied)
+                    {
+                        ok = false;
+                        break;
+                    }
                 }
                 if (runtime)
                 {

@@ -62,9 +62,37 @@ namespace ps2x::iop
         virtual bool writeGuest(uint32_t address, const void *source, size_t size) = 0;
         virtual bool zeroGuest(uint32_t address, size_t size) = 0;
         virtual bool normalizeGuestAddress(uint32_t address, uint32_t &normalized) const = 0;
+
+        // IOP RAM is a distinct address space from the EE guest. TODO remove this later
+        virtual bool readIopMemory(uint32_t address, void *destination, size_t size) const
+        {
+            (void)address;
+            (void)destination;
+            (void)size;
+            return false;
+        }
+        virtual bool writeIopMemory(uint32_t address, const void *source, size_t size)
+        {
+            (void)address;
+            (void)source;
+            (void)size;
+            return false;
+        }
+        virtual bool zeroIopMemory(uint32_t address, size_t size)
+        {
+            (void)address;
+            (void)size;
+            return false;
+        }
+        virtual bool normalizeIopAddress(uint32_t address, uint32_t &normalized) const
+        {
+            (void)address;
+            normalized = 0u;
+            return false;
+        }
         virtual uint32_t allocateIopHandle(IopHandleKind kind) = 0;
-        virtual uint32_t allocateIopHeap(uint32_t size) = 0;
-        virtual bool freeIopHeap(uint32_t address) = 0;
+        virtual uint32_t allocateIopHeap(uint32_t) { return 0u; }
+        virtual bool freeIopHeap(uint32_t) { return false; }
         virtual uint32_t allocateGuest(uint32_t size, uint32_t alignment) = 0;
         virtual void freeGuest(uint32_t address) = 0;
 
@@ -80,10 +108,7 @@ namespace ps2x::iop
                                   size_t size,
                                   size_t &bytesRead) = 0;
         virtual void closeHostFile(uint64_t handle) = 0;
-        virtual bool readCdSectors(uint32_t lbn,
-                                   uint32_t sectors,
-                                   void *destination,
-                                   size_t size) = 0;
+        virtual bool readCdSectors(uint32_t, uint32_t, void *, size_t) { return false; }
 
         virtual int32_t memoryCard(const MemoryCardRequest &request) = 0;
 
@@ -92,7 +117,7 @@ namespace ps2x::iop
         // guest observes a frozen controller. Data layout matches the EE
         // pad status block (mode at [1], buttons at [2..3], sticks at
         // [4..7]); size must be at least 32.
-        virtual bool readPadState(int port, int slot, uint8_t *data, size_t size) = 0;
+        virtual bool readPadState(int, int, uint8_t *, size_t) { return false; }
 
         virtual bool hasGuestFunction(uint32_t address) const = 0;
         virtual bool invokeGuestFunction(uint64_t callToken,
@@ -102,6 +127,18 @@ namespace ps2x::iop
                                          uint32_t a2,
                                          uint32_t a3,
                                          uint32_t *resultAddress) = 0;
+
+        // Deliver an IOP -> EE SIF command packet. The default keeps hosts
+        // which do not emulate the EE command dispatcher source-compatible.
+        virtual bool sendSifCommand(uint32_t commandId,
+                                    const void *packet,
+                                    size_t packetSize)
+        {
+            (void)commandId;
+            (void)packet;
+            (void)packetSize;
+            return false;
+        }
 
         virtual void log(LogLevel level, std::string_view message) = 0;
     };
