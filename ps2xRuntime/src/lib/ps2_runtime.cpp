@@ -1757,8 +1757,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         if (policy == MissingFunctionPolicy::ContinueToTarget)
         {
             ctx->pc = targetPc;
-            // if you need the app to keep open to open debug pannel change this to false
-            return false;
+            // Preserve the existing debug-policy continuation behavior.
+            // Strict Stop and the explicit SkipCallDebug policy are unchanged.
+            return true;
         }
 
         return false;
@@ -3701,21 +3702,6 @@ void PS2Runtime::run()
                                   << " n=" << std::dec << probeTop[i].second << std::endl);
                     }
                 }
-                RUNTIME_LOG("[run:tick] tick=" << tick
-                                               << " pc=0x" << std::hex << dbgPc
-                                               << " ra=0x" << dbgRa
-                                               << " sp=0x" << dbgSp
-                                               << " gp=0x" << dbgGp
-                                               << " dispfb1=0x" << gs.dispfb1
-                                               << " display1=0x" << gs.display1
-                                               << std::dec
-                                               << " activeThreads=" << eeSnapshot.threads.size()
-                                               << " dma=" << curDma
-                                               << " gif=" << curGif
-                                               << " gsw=" << curGs
-                                               << " vif=" << curVif
-                                               << std::endl);
-
             }
         });
         uint32_t presentWidth = FB_WIDTH;
