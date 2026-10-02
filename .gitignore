@@ -23,3 +23,15 @@ android/app/.cxx/
 android/local.properties
 android/.gradle/ 
 .idea/
+
+# Local editor state and private research/recovery files.
+/docs/katamari/PROGRESS_BACKUP_*.txt
+*.iso
+*.p2s
+*.p2s.*
+*.rgba
+*.tar.xz
+*.bundle
+SLUS_210.08
+/game-work/
+/katamari-work/

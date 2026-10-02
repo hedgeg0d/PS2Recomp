@@ -64,10 +64,18 @@ def main():
             if not path.exists() or path.read_text() != content:
                 path.write_text(content)
 
+        # A package must remain buildable after moving it to another machine.
+        # Copy only the selected source units/headers, never absolute includes.
+        sources = output / "sources"
+        sources.mkdir(exist_ok=True)
+        for name in ["ps2_recompiled_functions.h", "ps2_recompiled_stubs.h"] + [
+                f"{function}.cpp" for function in names]:
+            write(f"sources/{name}", (generated / name).read_text())
+
         prefix = ('#include "ps2_runtime.h"\n#include "ps2_runtime_macros.h"\n'
                   '#include "ps2_syscalls.h"\n#include "ps2_stubs.h"\n#include <stdexcept>\n'
-                  f'#include "{generated}/ps2_recompiled_functions.h"\n'
-                  f'#include "{generated}/ps2_recompiled_stubs.h"\n'
+                  '#include "sources/ps2_recompiled_functions.h"\n'
+                  '#include "sources/ps2_recompiled_stubs.h"\n'
                   '#include "overlay_declarations.h"\n')
         declarations = '#pragma once\n#include "ps2_runtime.h"\nnamespace CompiledOverlay {\n'
         declarations += ''.join(f'void {name}(uint8_t *, R5900Context *, PS2Runtime *);\n' for name in names)
@@ -77,7 +85,7 @@ def main():
         for index in range(0, len(names), 16):
             name = f"overlay_unit_{index // 16}.cpp"
             body = prefix + 'namespace CompiledOverlay {\n'
-            body += ''.join(f'#include "{generated}/{function}.cpp"\n' for function in names[index:index + 16])
+            body += ''.join(f'#include "sources/{function}.cpp"\n' for function in names[index:index + 16])
             write(name, body + '}\n')
             files.append(name)
         body = ('#include "overlay_declarations.h"\n#include "runtime/code_overlays.h"\n'

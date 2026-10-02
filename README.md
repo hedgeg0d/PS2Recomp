@@ -1,122 +1,54 @@
-# Katamari Damacy - PS2Recomp work branch
+# Katamari Damacy — PS2Recomp research branch
 
-This branch is a working snapshot of PS2Recomp while recompiling the NTSC-U
-release of *Katamari Damacy* (`SLUS_210.08`). It is not a finished port yet.
+Work on recompiling the NTSC-U release, `SLUS_210.08`. Not a finished port,
+not playable yet, and not an upstream-ready patch set.
 
-Katamari is proving unusually interesting to reverse-engineer. The game appears
-to use a custom engine with a long initialization path, several IOP services,
-disc streaming, and executable code loaded into RAM at runtime. That last part
-is handled here as a code overlay: the runtime selects compiled functions only
-when the loaded RAM contains the expected instruction identity. It does not
-patch guest RAM, replace frames, or upload substitute graphics to GS.
+The game has a long custom-engine initialization path, IOP services, disc
+streaming, and executable code loaded into RAM at runtime. The overlay support
+selects separately compiled functions by matching loaded instruction words.
+It does not inject replacement frames or graphics.
 
-The current build reaches the real Memory Card access screen. The next targets
-are the memory-card dialog, title screen, and intro sequence.
+## Current progress
 
-## What is in this branch
+The validated development build reaches the memory-card dialog, Namco logo,
+and several real intro frames with cows and stars. Full intro playback still
+stops. These frames use guest MPEG code and software IPU decoding, then the GS;
+they are not supplied by the FFmpeg HLE path.
 
-- `docs/katamari/katamari_patched.csv` - current Ghidra function map.
-- `docs/katamari/katamari_ghidra.toml` - recompiler configuration template.
-- `docs/katamari/ExportPS2FunctionsHeadless.java` - headless Ghidra exporter.
-- `ps2xRecomp/tools/package_overlay.py` - packages separately compiled runtime
-  overlays without symbol collisions.
-- `ps2xRuntime/include/runtime/code_overlays.h` - generic overlay selection API.
-- Runtime, IOP, scheduler, CD/SIF, MPEG, pad, and GS progress needed by this
-  game, plus control-flow and incremental-generation fixes.
-
-The game-specific runner, ISO/ELF, generated C++, overlay package, dumps, and
-logs remain outside Git.
+The milestone currently uses opt-in **game-generated-code test hooks** to
+choose/confirm the memory-card answer. Those hooks and the commercial-game
+overlay export are not included here. A fresh checkout is therefore a research
+toolchain snapshot, **not a one-command reproduction of the intro milestone**.
 
 ## Build and run
 
-These commands use the local development layout. Keep the existing build cache;
-do not use `--clean-first`.
+Start by setting the path to your own ISO. Follow [the setup guide](docs/katamari/RUNNING.md)
+for dependencies, ELF extraction, CMake configuration, recompilation, overlay
+requirements, and a bounded launch. No machine-specific paths or native-CPU
+tuning are needed. A [generic runner](examples/recompiled-game/main.cpp) accepts
+the ELF and ISO as command-line arguments.
 
-```bash
-# Set these three paths first.
-export ISO_PATH="/path/to/Katamari Damacy.iso"
-export PS2RECOMP="/path/to/PS2Recomp"
-export KATAMARI_DIR="/path/to/katamari-work"
-export WORK_TMP="/path/to/temporary/katamari-work"
+[Status and validation checklist](docs/katamari/STATUS.md) records what works,
+what remains blocked, and what has actually been checked.
 
-cd "$PS2RECOMP"
-cmake --build out/build --target ps2_runtime -j8
-cmake --build out/build --target ps2_recomp -j8
+## Contents and scope
 
-cd "$KATAMARI_DIR"
-"$PS2RECOMP/out/build/ps2xRecomp/ps2_recomp" \
-  "$KATAMARI_DIR/katamari_ghidra.toml"
+- Current function map, TOML configuration, and Ghidra exporter in `docs/katamari`.
+- Generic overlay packaging and identity-based runtime dispatch.
+- Recompiler control-flow and incremental-generation fixes.
+- Runtime/IOP work covering SIF, CD streaming, scheduling, memory cards, pads,
+  GS transfers, and software IPU MPEG decoding.
+- A path-configurable example runner using the runtime's CMake dependencies.
 
-cd "$KATAMARI_DIR/runner"
-cmake -S . -B build -DPS2X_OVERLAY_PACKAGE="$WORK_TMP/stream1-package"
-cmake --build build -j8
-```
+This branch still contains exploratory diagnostics and compatibility work.
+The TOML also contains game-specific instruction patches; these are not
+universal runtime fixes. Generic changes will be refined, regression-tested,
+and split into focused upstream PRs.
 
-The runner expects the local `SLUS_210.08` and Katamari ISO. Set its local disc
-image configuration to `$ISO_PATH`; the sample runner takes the ELF path as its
-first argument and uses that disc image for CD reads.
+ISOs, extracted game files, generated game C++, overlay snapshots, run logs,
+private worklogs, and recovery archives stay outside Git. PCSX2-derived MPEG
+code retains its notices; see [third-party attribution](docs/THIRD_PARTY.md).
 
-```bash
-cd "$KATAMARI_DIR/runner"
-timeout --signal=TERM --kill-after=2s 90s \
-  env PS2X_CODE_OVERLAY=1 PS2X_MCSERV_VER=210 PS2X_MCMAN_VER=226 \
-  ./build/ps2x_katamari "$KATAMARI_DIR/SLUS_210.08"
-pkill -x ps2x_katamari 2>/dev/null || true
-pgrep -x ps2x_katamari || true
-```
-
-## Building the overlay
-
-The overlay is a separate recompiler export of the executable region that the
-game loads into RAM later. It is built from a RAM/ELF snapshot captured during
-analysis and an identity snapshot of the loaded instructions; it is not read
-from or embedded into the main repository. Package it with:
-
-```bash
-python3 "$PS2RECOMP/ps2xRecomp/tools/package_overlay.py" \
-  --generated "$WORK_TMP/stream1-aot" \
-  --identity-source "$WORK_TMP/identity.bin" \
-  --begin <overlay-start> --end <overlay-end> \
-  --output "$WORK_TMP/stream1-package"
-```
-
-Use the executable range exported from the matching snapshot for
-`<overlay-start>` and `<overlay-end>`. The runner's CMake file includes the
-resulting `overlay_sources.cmake` and links the generated units separately.
-
-Run logs should be kept outside the repository. Do not commit commercial game
-data, RAM/ELF snapshots, generated output, or build directories.
-
-## Recompilation plans
-
-This is exploratory work. The generic changes will be refined, split into
-focused patches, and proposed as separate PS2Recomp pull requests after the
-Katamari path is understood and regression-tested. The current test baseline is
-449/449; tests are intentionally not run during the bounded game experiments.
-
-### Describing Your Game Project
-
-A game project built with PS2Recomp can describe itself in a `.recomp.json` file at the root of its repository. Lists of recomp and decomp projects, such as [recomp.board](https://recomp.fyi), read that file instead of guessing the game, system and status from the README.
-
-> [!NOTE]
-> This file is optional: PS2Recomp does not read it and works the same without it. `.recomp.json` and recomp.board are third-party projects; the PS2Recomp developers have no ties to them.
-
-Starter file:
-
-```json
-{
-  "$schema": "https://recomp.fyi/schema/v1.json",
-  "game": "<title as it shipped>",
-  "system": "PS2",
-  "type": "recomp",
-  "toolchain": "PS2Recomp",
-  "status": "in-progress",
-  "original": { "region": "USA", "serial": "SLUS-20312" }
-}
-```
-
-* `original` is the release a user must own. On retail discs the ELF is named after the serial (`SLUS_203.12` is `SLUS-20312`), and the prefix gives the region: `SLUS`/`SCUS` USA, `SLES`/`SCES` Europe, `SLPS`/`SLPM`/`SCPS` Japan.
-* `status` is one of `exploring`, `in-progress`, `playable`, `released`, `complete`, `paused`. Edit it when the project moves on: a stale status is worse than none.
-* Never put a game file, or a link to one, in the file.
-
-Other fields (Wikidata item, target platforms, maintainers, links, what help is wanted) and the JSON Schema are in the [specification](https://recomp.fyi/spec).
+The optional third-party `.recomp.json` project metadata format is described
+in the [upstream project specification](https://recomp.fyi/spec). It is not
+required by PS2Recomp.
