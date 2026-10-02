@@ -46,12 +46,8 @@ game-specific TOML instruction patches. It is public research code, not a
 claim that every diff is a universal production fix. Upstream PRs will need
 smaller patches, diagnostic cleanup, and fresh regression coverage.
 
-## Publication check — 2026-10-02
+## Latest build checks — 2026-10-02
 
-- Tracked text scanned for personal filesystem paths and common credential
-  patterns; no matches. Private notes/editor state moved outside the checkout.
-- Private backup note removed from unpublished branch history only. Existing
-  remote/upstream history preserved; normal fast-forward publication remains possible.
 - Runtime/recompiler built incrementally with eight jobs. Generic runner built
   from a fresh CMake cache against the existing milestone export.
 - Fresh CSV/TOML regeneration succeeded in explicit-map mode. All regenerated
@@ -60,8 +56,6 @@ smaller patches, diagnostic cleanup, and fresh regression coverage.
 - Relocated overlay package passed a C++ compile check without absolute includes.
 - Generic runner repeated the 100-second milestone gate: memory-card dialog,
   cow/star frames, 28 CSC frames, matching frame-10 hash, no leftover processes.
-- Recovery archives and the previously working game binary retained privately.
-- No push performed.
 
 ## Acceptance checklist for future changes
 
