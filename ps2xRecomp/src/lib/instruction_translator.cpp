@@ -69,14 +69,8 @@ namespace ps2recomp
 
     MemoryAccessHint InstructionTranslator::effectiveMemoryHintFor(const Instruction &inst, const MemoryAccessHint &memoryHint) const
     {
-        MemoryAccessHint effectiveMemoryHint = memoryHint;
-        if (inst.isMmio)
-        {
-            effectiveMemoryHint.hasAddress = true;
-            effectiveMemoryHint.address = inst.mmioAddress;
-        }
-
-        return effectiveMemoryHint;
+        // TODO disable for now since it causing issues with some games.
+        return memoryHint;
     }
 
     std::string InstructionTranslator::translateMemoryRead(const Instruction &inst,
