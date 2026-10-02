@@ -384,6 +384,7 @@ add_library(ps2_runtime STATIC
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
     src/lib/ps2_iop_host.cpp
+    src/lib/ipu_mpeg2_decoder.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
     src/lib/ps2_rom_device.cpp
@@ -506,6 +507,12 @@ target_include_directories(ps2_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
 )
+
+# Public runtime headers expose SSE4.1 R5900 helpers on x86. Propagate the
+# required ISA to consumers rather than relying on a developer's CXX_FLAGS.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$" AND NOT MSVC)
+    target_compile_options(ps2_runtime PUBLIC -msse4.1)
+endif()
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
 target_link_libraries(ps2EntryRunner

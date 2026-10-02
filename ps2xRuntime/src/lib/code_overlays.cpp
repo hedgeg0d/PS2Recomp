@@ -17,7 +17,6 @@ namespace ps2x
         {
             const uint8_t *ram;
             std::vector<CodeOverlay> overlays;
-            bool activated = false;
         };
 
         struct Registry
@@ -64,7 +63,7 @@ namespace ps2x
         }
         auto &state = registry();
         std::lock_guard<std::mutex> lock(state.mutex);
-        state.runtimes.insert_or_assign(runtime, RuntimeOverlays{ram, std::move(overlays), false});
+        state.runtimes.insert_or_assign(runtime, RuntimeOverlays{ram, std::move(overlays)});
     }
 
     void clearCodeOverlays(const PS2Runtime *runtime)
@@ -93,8 +92,7 @@ namespace ps2x
                     const auto *p = found->second.ram + word.address;
                     const uint32_t actual = uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
                                             (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
-                    if (actual != word.value && std::getenv("PS2X_OVERLAY_TRACE") != nullptr &&
-                        (pc == 0x1038140u || pc == 0x1038248u))
+                    if (actual != word.value && std::getenv("PS2X_OVERLAY_TRACE") != nullptr)
                     {
                         static uint32_t mismatchLog = 0u;
                         if (mismatchLog++ < 16u)
@@ -103,17 +101,6 @@ namespace ps2x
                     }
                     return actual == word.value;
                 });
-            // TEMP test only: keep dispatching the compiled overlay after the
-            // guest reloads the original ELF bytes into the same address.
-            // This confirms whether the fallback ELF function is the blocker.
-            if (sameCode)
-                found->second.activated = true;
-            if (!sameCode && found->second.activated &&
-                std::getenv("PS2X_OVERLAY_STICKY") != nullptr &&
-                pc >= 0x1038140u && pc < 0x1264934u)
-            {
-                sameCode = true;
-            }
             if (!sameCode)
                 continue;
             if (matched)

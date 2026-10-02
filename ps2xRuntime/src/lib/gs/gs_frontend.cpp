@@ -699,8 +699,11 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         if (flg == GIF_FMT_IMAGE)
         {
             static std::atomic<uint32_t> imageTagProbes{0u};
+            static std::atomic<uint32_t> largeImageTagProbes{0u};
             const uint32_t imageTagProbe = imageTagProbes.fetch_add(1u, std::memory_order_relaxed);
-            if (imageTagProbe < 32u)
+            const bool largeImage = nloop >= 0x1000u &&
+                                    largeImageTagProbes.fetch_add(1u, std::memory_order_relaxed) < 64u;
+            if (imageTagProbe < 32u || imageTagProbe % 256u == 0u || largeImage)
             {
                 const uint32_t imageBytes = nloop * 16u;
                 uint32_t first = 0u;
